@@ -4,6 +4,14 @@
 Proyek ini merupakan backend untuk portal berita yang dikembangkan menggunakan **Fastify**, sebuah framework Node.js yang ringan dan cepat. Backend ini menyediakan RESTful API untuk mengelola berita, kategori, pengguna, dan fitur lainnya yang diperlukan dalam sebuah portal berita.
 
 ## 🚀 Teknologi yang Digunakan
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=node.js&logoColor=white)
+![Fastify](https://img.shields.io/badge/Fastify-000000?style=for-the-badge&logo=fastify&logoColor=white)
+![Laravel](https://img.shields.io/badge/Laravel-FF2D20?style=for-the-badge&logo=laravel&logoColor=white)
+![MySQL](https://img.shields.io/badge/MySQL-4479A1?style=for-the-badge&logo=mysql&logoColor=white)
+![PHP](https://img.shields.io/badge/PHP-777BB4?style=for-the-badge&logo=php&logoColor=white)
+![Ubuntu](https://img.shields.io/badge/Ubuntu-E95420?style=for-the-badge&logo=ubuntu&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+
 - **Node.js** (Runtime JavaScript)
 - **Fastify** (Web Framework)
 - **PostgreSQL** (Database Utama)
