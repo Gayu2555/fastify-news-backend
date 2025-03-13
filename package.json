@@ -1,0 +1,11 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@fastify/cors": "^9.0.0",
+    "@fastify/jwt": "^7.0.0",
+    "@fastify/rate-limit": "^7.3.0",
+    "dotenv": "^16.4.7",
+    "fastify": "^4.29.0",
+    "mysql2": "^3.6.0"
+  }
+}
