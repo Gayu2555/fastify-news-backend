@@ -1,946 +1,1052 @@
-import dotenv from "dotenv";
-import Fastify from "fastify";
-import mysql from "mysql2/promise";
-import FastifyRateLimit from "@fastify/rate-limit";
-import FastifyCors from "@fastify/cors";
-import FastifyJWT from "@fastify/jwt";
+"use strict";
+
+import path from "path";
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import Fastify from "fastify";
+import fastifyCors from "@fastify/cors";
+import fastifyWebsocket from "@fastify/websocket";
+import knex from "knex";
+import bcrypt from "bcrypt";
+import nodeCron from "node-cron";
 import crypto from "crypto";
+import slugify from "slugify";
+import dotenv from "dotenv";
 
-// Mendapatkan path direktori untuk modul saat ini
+// Load environment variables
+dotenv.config();
+
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = path.dirname(__filename);
 
-// Memuat variabel lingkungan dengan path eksplisit
-dotenv.config({ path: join(__dirname, ".env") });
+// Create Fastify instance
+const fastify = Fastify({
+  logger: {
+    level: process.env.LOG_LEVEL || "info",
+    transport: {
+      target: "pino-pretty",
+      options: {
+        translateTime: "HH:MM:ss Z",
+        ignore: "pid,hostname",
+        colorize: true,
+      },
+    },
+  },
+});
 
-// Log debug untuk memeriksa variabel lingkungan
-console.log("Variabel lingkungan dimuat:");
-console.log("DB_HOST:", process.env.DB_HOST || "Tidak diatur");
-console.log("DB_USER:", process.env.DB_USER || "Tidak diatur");
-console.log(
-  "DB_PASSWORD:",
-  process.env.DB_PASSWORD ? "Diatur (tersembunyi)" : "Tidak diatur"
+// Database Configuration from environment variables
+const dbConfig = {
+  client: "mysql2",
+  connection: {
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+  },
+  pool: { min: 0, max: 7 },
+};
+
+// Initialize database connection with better error handling
+let db;
+try {
+  fastify.log.info("Connecting to database...");
+  fastify.log.info(
+    `Host: ${process.env.DB_HOST}, Port: ${process.env.DB_PORT}, Database: ${process.env.DB_NAME}`
+  );
+  db = knex(dbConfig);
+
+  // Test database connection
+  db.raw("SELECT 1")
+    .then(() => {
+      fastify.log.info("Database connection successful");
+    })
+    .catch((err) => {
+      fastify.log.error("Database connection test failed:", err.message);
+      fastify.log.error("Database connection details:", {
+        host: process.env.DB_HOST,
+        port: process.env.DB_PORT,
+        user: process.env.DB_USER,
+        database: process.env.DB_NAME,
+      });
+    });
+} catch (err) {
+  fastify.log.error("Failed to initialize database connection:", err.message);
+  fastify.log.error("Database config:", {
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    database: process.env.DB_NAME,
+  });
+  process.exit(1);
+}
+
+// Register CORS plugin
+fastify.register(fastifyCors, {
+  origin: "*",
+});
+
+// Register WebSocket plugin
+fastify.register(fastifyWebsocket, {
+  options: { maxPayload: 1048576 },
+});
+
+// Utility Functions for Encryption/Decryption
+const encryptionUtils = {
+  // Generate a random encryption key if not set in environment
+  encryptionKey:
+    process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString("hex"),
+
+  // Encrypt data
+  encrypt(text) {
+    const iv = crypto.randomBytes(16);
+    const key = Buffer.from(this.encryptionKey, "hex");
+    const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+    let encrypted = cipher.update(text, "utf8", "hex");
+    encrypted += cipher.final("hex");
+    return iv.toString("hex") + ":" + encrypted;
+  },
+
+  // Decrypt data
+  decrypt(text) {
+    const parts = text.split(":");
+    const iv = Buffer.from(parts[0], "hex");
+    const encryptedText = parts[1];
+    const key = Buffer.from(this.encryptionKey, "hex");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+    let decrypted = decipher.update(encryptedText, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return decrypted;
+  },
+};
+
+// Database models
+const models = {
+  // Category Model
+  Category: {
+    tableName: "categories",
+
+    async getAll() {
+      try {
+        return db(this.tableName).select("*");
+      } catch (err) {
+        fastify.log.error(`Error fetching all categories: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async findById(id) {
+      try {
+        return db(this.tableName).where({ id }).first();
+      } catch (err) {
+        fastify.log.error(`Error finding category by ID ${id}: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async findBySlug(slug) {
+      try {
+        return db(this.tableName).where({ slug }).first();
+      } catch (err) {
+        fastify.log.error(
+          `Error finding category by slug ${slug}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+  },
+
+  // Article Model
+  Article: {
+    tableName: "articles",
+
+    async getAll(filters = {}) {
+      try {
+        const query = db(this.tableName)
+          .select("articles.*", "categories.name as category_name")
+          .join("categories", "articles.category_id", "categories.id");
+
+        if (filters.category_id) {
+          query.where("articles.category_id", filters.category_id);
+        }
+
+        if (filters.search) {
+          query.where(function () {
+            this.where("articles.title", "like", `%${filters.search}%`).orWhere(
+              "articles.content",
+              "like",
+              `%${filters.search}%`
+            );
+          });
+        }
+
+        return query.orderBy(
+          filters.sort_by || "articles.created_at",
+          filters.sort_order || "desc"
+        );
+      } catch (err) {
+        fastify.log.error(
+          `Error fetching articles with filters ${JSON.stringify(filters)}: ${
+            err.message
+          }`
+        );
+        throw err;
+      }
+    },
+
+    async findById(id) {
+      try {
+        return db(this.tableName)
+          .select("articles.*", "categories.name as category_name")
+          .join("categories", "articles.category_id", "categories.id")
+          .where("articles.id", id)
+          .first();
+      } catch (err) {
+        fastify.log.error(`Error finding article by ID ${id}: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async findBySlug(slug) {
+      try {
+        return db(this.tableName)
+          .select("articles.*", "categories.name as category_name")
+          .join("categories", "articles.category_id", "categories.id")
+          .where("articles.slug", slug)
+          .first();
+      } catch (err) {
+        fastify.log.error(
+          `Error finding article by slug ${slug}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+  },
+
+  // ArticlePosition Model
+  ArticlePosition: {
+    tableName: "article_positions",
+
+    async getPositionsByCategory(categoryId) {
+      try {
+        return db(this.tableName)
+          .select(
+            "article_positions.*",
+            "articles.title",
+            "articles.slug as article_slug",
+            "articles.image_url",
+            "articles.description"
+          )
+          .join("articles", "article_positions.article_id", "articles.id")
+          .where("article_positions.category_id", categoryId);
+      } catch (err) {
+        fastify.log.error(
+          `Error getting positions for category ID ${categoryId}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+
+    async getByPosition(position) {
+      try {
+        return db(this.tableName)
+          .select(
+            "article_positions.*",
+            "articles.title",
+            "articles.slug as article_slug",
+            "articles.image_url",
+            "articles.description",
+            "categories.name as category_name",
+            "categories.slug as category_slug"
+          )
+          .join("articles", "article_positions.article_id", "articles.id")
+          .join("categories", "article_positions.category_id", "categories.id")
+          .where("article_positions.position", position);
+      } catch (err) {
+        fastify.log.error(
+          `Error getting articles by position ${position}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+  },
+
+  // Fungsi Pemodelan untuk User
+  User: {
+    tableName: "users",
+
+    async findById(id) {
+      try {
+        return db(this.tableName).where({ id }).first();
+      } catch (err) {
+        fastify.log.error(`Error finding user by ID ${id}: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async findByEmail(email) {
+      try {
+        return db(this.tableName).where({ email }).first();
+      } catch (err) {
+        fastify.log.error(
+          `Error finding user by email ${email}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+
+    async verifyPassword(email, password) {
+      try {
+        const user = await this.findByEmail(email);
+
+        if (!user) {
+          fastify.log.info(`Login failed: User with email ${email} not found`);
+          return false;
+        }
+
+        const isValid = await bcrypt.compare(password, user.password);
+
+        if (isValid) {
+          fastify.log.info(`User ${email} successfully authenticated`);
+          delete user.password;
+          return user;
+        }
+
+        fastify.log.info(`Login failed: Invalid password for user ${email}`);
+        return false;
+      } catch (err) {
+        fastify.log.error(
+          `Error verifying password for user ${email}: ${err.message}`
+        );
+        throw err;
+      }
+    },
+  },
+
+  // Fungsi Pemodelan API KEY
+  ApiKey: {
+    tableName: "api_keys",
+
+    async generateKey() {
+      return crypto.randomBytes(32).toString("hex");
+    },
+
+    async findValidKey(key) {
+      try {
+        const apiKey = await db(this.tableName)
+          .where({ key, is_active: true })
+          .where("expires_at", ">", db.fn.now())
+          .first();
+
+        if (apiKey) {
+          fastify.log.debug(`Valid API key found: ID ${apiKey.id}`);
+        } else {
+          fastify.log.debug(`No valid API key found for provided key`);
+        }
+
+        return apiKey;
+      } catch (err) {
+        fastify.log.error(`Error finding valid API key: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async deleteExpiredKeys() {
+      try {
+        const deleted = await db(this.tableName)
+          .where("expires_at", "<=", db.fn.now())
+          .delete();
+        fastify.log.info(`Deleted ${deleted} expired API keys`);
+        return deleted;
+      } catch (err) {
+        fastify.log.error(`Error deleting expired API keys: ${err.message}`);
+        throw err;
+      }
+    },
+
+    async rotateKeys() {
+      try {
+        // Generate a new key
+        const key = await this.generateKey();
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+        const [id] = await db(this.tableName).insert({
+          key,
+          description: "Auto-rotated API key",
+          expires_at: expiresAt,
+        });
+
+        const newKey = await db(this.tableName).where({ id }).first();
+
+        fastify.log.info(
+          `New API key generated with ID ${newKey.id}, expires at ${expiresAt}`
+        );
+
+        // Deactivate older keys
+        const updated = await db(this.tableName)
+          .where("id", "!=", newKey.id)
+          .update({ is_active: false });
+
+        fastify.log.info(`Deactivated ${updated} older API keys`);
+
+        return newKey;
+      } catch (err) {
+        fastify.log.error(`Error rotating API keys: ${err.message}`);
+        throw err;
+      }
+    },
+  },
+
+  // Client Connection Model to store WebSocket client connections
+  ClientConnection: {
+    // In-memory store for client connections (can be moved to Redis for production)
+    connections: new Map(),
+
+    // Add a new client connection
+    addConnection(clientId, connection) {
+      this.connections.set(clientId, connection);
+      fastify.log.info(`Client ${clientId} connected via WebSocket`);
+      return clientId;
+    },
+
+    // Remove a client connection
+    removeConnection(clientId) {
+      const removed = this.connections.delete(clientId);
+      fastify.log.info(`Client ${clientId} disconnected from WebSocket`);
+      return removed;
+    },
+
+    // Get a specific client connection
+    getConnection(clientId) {
+      return this.connections.get(clientId);
+    },
+
+    // Get all client connections
+    getAllConnections() {
+      return Array.from(this.connections.keys());
+    },
+
+    // Broadcast a message to all connected clients
+    broadcastMessage(message) {
+      let count = 0;
+      for (const [clientId, connection] of this.connections.entries()) {
+        try {
+          connection.socket.send(JSON.stringify(message));
+          count++;
+        } catch (err) {
+          fastify.log.error(
+            `Error sending message to client ${clientId}: ${err.message}`
+          );
+          this.removeConnection(clientId); // Remove broken connections
+        }
+      }
+      fastify.log.info(`Broadcasted message to ${count} clients`);
+      return count;
+    },
+  },
+};
+
+// API Key middleware - FIXED to properly halt execution
+async function verifyApiKey(request, reply) {
+  try {
+    const apiKey = request.headers["x-api-key"];
+
+    if (!apiKey) {
+      fastify.log.warn(`API key verification failed: Missing x-api-key header`);
+      throw new Error("API key required");
+    }
+
+    fastify.log.debug(`Verifying API key: ${apiKey.substring(0, 8)}...`);
+
+    const validKey = await models.ApiKey.findValidKey(apiKey);
+
+    if (!validKey) {
+      fastify.log.warn(`API key verification failed: Invalid or expired key`);
+      throw new Error("Invalid API key");
+    }
+
+    fastify.log.info(
+      `Valid API key used: ID ${validKey.id}, description: "${validKey.description}"`
+    );
+  } catch (err) {
+    fastify.log.error(`API key verification failed: ${err.message}`);
+    return reply.code(401).send({ success: false, message: "Invalid API key" });
+  }
+}
+
+// Request logging middleware
+async function requestLogger(request, reply) {
+  const { method, url, ip } = request;
+  const userAgent = request.headers["user-agent"] || "unknown";
+
+  fastify.log.info({
+    msg: `Incoming request: ${method} ${url}`,
+    ip: ip,
+    userAgent: userAgent,
+    params: request.params,
+    query: request.query,
+  });
+}
+
+// API Key
+// Fungsi pergantian API KEY, setiap 6 Jam sekali (Cron Job)
+async function rotateApiKeys() {
+  try {
+    fastify.log.info("Starting scheduled API key rotation");
+
+    // Check database connection before proceeding
+    try {
+      await db.raw("SELECT 1");
+      fastify.log.debug("Database connection verified for API key rotation");
+    } catch (dbErr) {
+      fastify.log.error(
+        `Database connection failed during API key rotation: ${dbErr.message}`
+      );
+      return;
+    }
+
+    const newKey = await models.ApiKey.rotateKeys();
+    fastify.log.info(`API key rotation complete. New key ID: ${newKey.id}`);
+
+    // Notify clients about key rotation via WebSocket (optional)
+    models.ClientConnection.broadcastMessage({
+      type: "system",
+      action: "api_key_rotated",
+      message: "API keys have been rotated. Please obtain a new key.",
+      timestamp: new Date().toISOString(),
+    });
+
+    // Clean up expired keys
+    await models.ApiKey.deleteExpiredKeys();
+  } catch (err) {
+    fastify.log.error(`Error during API key rotation: ${err.message}`);
+  }
+}
+
+// Improved security middleware
+async function securityMiddleware(request, reply) {
+  // Add security headers
+  reply.header("X-Content-Type-Options", "nosniff");
+  reply.header("X-Frame-Options", "DENY");
+  reply.header("X-XSS-Protection", "1; mode=block");
+  reply.header(
+    "Strict-Transport-Security",
+    "max-age=31536000; includeSubDomains"
+  );
+
+  // Rate limiting can be added here
+
+  // Validate request size
+  const contentLength = request.headers["content-length"]
+    ? parseInt(request.headers["content-length"])
+    : 0;
+  if (contentLength > 10485760) {
+    // 10MB limit
+    fastify.log.warn(`Request size exceeded limit: ${contentLength} bytes`);
+    return reply
+      .code(413)
+      .send({ success: false, message: "Request entity too large" });
+  }
+}
+
+// WebSocket authentication middleware
+async function wsAuthMiddleware(connection, request) {
+  try {
+    const { socket } = connection;
+    const apiKey = request.headers["x-api-key"];
+
+    if (!apiKey) {
+      fastify.log.warn(`WebSocket authentication failed: Missing API key`);
+      socket.send(
+        JSON.stringify({
+          type: "error",
+          message: "Authentication required. Please provide a valid API key.",
+        })
+      );
+      socket.close();
+      return false;
+    }
+
+    const validKey = await models.ApiKey.findValidKey(apiKey);
+
+    if (!validKey) {
+      fastify.log.warn(`WebSocket authentication failed: Invalid API key`);
+      socket.send(
+        JSON.stringify({
+          type: "error",
+          message: "Invalid API key. Connection rejected.",
+        })
+      );
+      socket.close();
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    fastify.log.error(`WebSocket authentication error: ${err.message}`);
+    connection.socket.close();
+    return false;
+  }
+}
+
+// Set up scheduled tasks
+function setupScheduledTasks() {
+  // Rotate API keys every day at midnight
+  nodeCron.schedule("0 0 * * *", rotateApiKeys);
+
+  // Clean up expired API keys every 6 hours
+  nodeCron.schedule("0 */6 * * *", async () => {
+    try {
+      await models.ApiKey.deleteExpiredKeys();
+    } catch (err) {
+      fastify.log.error(`Error cleaning up expired API keys: ${err.message}`);
+    }
+  });
+}
+
+// Register global hooks
+fastify.addHook("onRequest", requestLogger);
+fastify.addHook("onRequest", securityMiddleware);
+
+// Define routes
+// Categories API
+fastify.get(
+  "/api/categories",
+  { preHandler: verifyApiKey },
+  async (request, reply) => {
+    try {
+      const categories = await models.Category.getAll();
+      return { success: true, data: categories };
+    } catch (err) {
+      fastify.log.error(`Error fetching categories: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  }
 );
-console.log("DB_NAME:", process.env.DB_NAME || "Tidak diatur");
 
-const fastify = Fastify({ logger: true });
+fastify.get(
+  "/api/categories/:slug",
+  { preHandler: verifyApiKey },
+  async (request, reply) => {
+    try {
+      const { slug } = request.params;
+      const category = await models.Category.findBySlug(slug);
 
-// Fungsi untuk menghasilkan token acak
-function generateRandomToken(length = 64) {
-  return crypto.randomBytes(length).toString("hex");
+      if (!category) {
+        return reply
+          .code(404)
+          .send({ success: false, message: "Category not found" });
+      }
+
+      return { success: true, data: category };
+    } catch (err) {
+      fastify.log.error(`Error fetching category: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  }
+);
+
+// Articles API
+fastify.get(
+  "/api/articles",
+  { preHandler: verifyApiKey },
+  async (request, reply) => {
+    try {
+      const articles = await models.Article.getAll(request.query);
+      return { success: true, data: articles };
+    } catch (err) {
+      fastify.log.error(`Error fetching articles: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  }
+);
+
+fastify.get(
+  "/api/articles/:slug",
+  { preHandler: verifyApiKey },
+  async (request, reply) => {
+    try {
+      const { slug } = request.params;
+      const article = await models.Article.findBySlug(slug);
+
+      if (!article) {
+        return reply
+          .code(404)
+          .send({ success: false, message: "Article not found" });
+      }
+
+      return { success: true, data: article };
+    } catch (err) {
+      fastify.log.error(`Error fetching article: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  }
+);
+
+// Article positions API
+fastify.get(
+  "/api/positions/:position",
+  { preHandler: verifyApiKey },
+  async (request, reply) => {
+    try {
+      const { position } = request.params;
+      const articles = await models.ArticlePosition.getByPosition(position);
+
+      return { success: true, data: articles };
+    } catch (err) {
+      fastify.log.error(`Error fetching position articles: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  }
+);
+
+// Authentication
+fastify.post("/api/auth/login", async (request, reply) => {
+  try {
+    const { email, password } = request.body;
+
+    if (!email || !password) {
+      return reply
+        .code(400)
+        .send({ success: false, message: "Email and password required" });
+    }
+
+    const user = await models.User.verifyPassword(email, password);
+
+    if (!user) {
+      return reply
+        .code(401)
+        .send({ success: false, message: "Invalid credentials" });
+    }
+
+    // Generate session token
+    const token = crypto.randomBytes(64).toString("hex");
+
+    // Store token in database or Redis would be better in production
+    // For now, we'll return the token directly
+
+    return {
+      success: true,
+      data: {
+        user: { id: user.id, email: user.email, name: user.name },
+        token,
+      },
+    };
+  } catch (err) {
+    fastify.log.error(`Error during login: ${err.message}`);
+    return reply
+      .code(500)
+      .send({ success: false, message: "Internal server error" });
+  }
+});
+
+// WebSocket endpoint with encryption
+fastify.register(async function (fastify) {
+  fastify.get("/ws", { websocket: true }, async (connection, request) => {
+    try {
+      // Authenticate WebSocket connection
+      const isAuthenticated = await wsAuthMiddleware(connection, request);
+      if (!isAuthenticated) return;
+
+      // Generate client ID
+      const clientId = crypto.randomBytes(16).toString("hex");
+
+      // Store connection
+      models.ClientConnection.addConnection(clientId, connection);
+
+      // Send welcome message with client ID (encrypted)
+      const welcomeMessage = {
+        type: "system",
+        action: "connected",
+        clientId: clientId,
+        message: "Connection established successfully",
+        timestamp: new Date().toISOString(),
+      };
+
+      // Encrypt the welcome message
+      const encryptedWelcome = encryptionUtils.encrypt(
+        JSON.stringify(welcomeMessage)
+      );
+      connection.socket.send(
+        JSON.stringify({
+          encrypted: true,
+          data: encryptedWelcome,
+        })
+      );
+
+      // Handle incoming messages
+      connection.socket.on("message", async (message) => {
+        try {
+          const msgData = JSON.parse(message.toString());
+
+          // Handle encrypted messages
+          if (msgData.encrypted && msgData.data) {
+            try {
+              // Decrypt the message
+              const decrypted = encryptionUtils.decrypt(msgData.data);
+              const decryptedData = JSON.parse(decrypted);
+
+              fastify.log.debug(
+                `Received encrypted message from client ${clientId}: ${decrypted}`
+              );
+
+              // Process the decrypted message based on its type
+              switch (decryptedData.type) {
+                case "ping":
+                  // Send encrypted pong response
+                  const pongResponse = {
+                    type: "pong",
+                    timestamp: new Date().toISOString(),
+                  };
+                  const encryptedPong = encryptionUtils.encrypt(
+                    JSON.stringify(pongResponse)
+                  );
+                  connection.socket.send(
+                    JSON.stringify({
+                      encrypted: true,
+                      data: encryptedPong,
+                    })
+                  );
+                  break;
+
+                case "subscribe":
+                  // Handle subscription to topics/channels
+                  // Implementation would depend on your application needs
+                  break;
+
+                default:
+                  // Handle other message types
+                  break;
+              }
+            } catch (decryptErr) {
+              fastify.log.error(
+                `Failed to decrypt message from client ${clientId}: ${decryptErr.message}`
+              );
+              connection.socket.send(
+                JSON.stringify({
+                  type: "error",
+                  message: "Failed to decrypt message",
+                })
+              );
+            }
+          } else {
+            // Handle unencrypted messages (could reject them for security)
+            fastify.log.warn(
+              `Received unencrypted message from client ${clientId}`
+            );
+            connection.socket.send(
+              JSON.stringify({
+                type: "error",
+                message: "All messages must be encrypted",
+              })
+            );
+          }
+        } catch (msgErr) {
+          fastify.log.error(
+            `Error processing WebSocket message: ${msgErr.message}`
+          );
+        }
+      });
+
+      // Handle connection close
+      connection.socket.on("close", () => {
+        models.ClientConnection.removeConnection(clientId);
+      });
+    } catch (err) {
+      fastify.log.error(`WebSocket connection error: ${err.message}`);
+      if (connection.socket.readyState === 1) {
+        // 1 = OPEN
+        connection.socket.close();
+      }
+    }
+  });
+});
+
+// API Key management endpoint
+fastify.register(async function (fastify) {
+  // Apply API Key middleware
+  fastify.addHook("onRequest", verifyApiKey);
+
+  // Generate new API key (admin only)
+  fastify.post("/api/keys/generate", async (request, reply) => {
+    try {
+      // Additional admin authentication should be implemented here
+      // This is just a basic example
+      const { description, expiresInDays } = request.body;
+
+      // Generate a new key
+      const key = await models.ApiKey.generateKey();
+
+      // Calculate expiration date
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + (expiresInDays || 30)); // Default to 30 days
+
+      // Save to database
+      const [id] = await db(models.ApiKey.tableName).insert({
+        key,
+        description: description || "Manually generated API key",
+        expires_at: expiresAt,
+        is_active: true,
+      });
+
+      const newKey = await db(models.ApiKey.tableName).where({ id }).first();
+
+      fastify.log.info(
+        `New API key generated with ID ${id}, expires at ${expiresAt}`
+      );
+
+      // Only return the full key when it's first created
+      return {
+        success: true,
+        data: {
+          id: newKey.id,
+          key, // Only show full key on creation
+          description: newKey.description,
+          expires_at: newKey.expires_at,
+          is_active: newKey.is_active,
+        },
+        message: "Store this key securely as it won't be shown again!",
+      };
+    } catch (err) {
+      fastify.log.error(`Error generating API key: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Failed to generate API key" });
+    }
+  });
+
+  // Get all API keys (admin only)
+  fastify.get("/api/keys", async (request, reply) => {
+    try {
+      // Additional admin authentication should be implemented here
+
+      const keys = await db(models.ApiKey.tableName)
+        .select("id", "description", "created_at", "expires_at", "is_active")
+        .orderBy("created_at", "desc");
+
+      return { success: true, data: keys };
+    } catch (err) {
+      fastify.log.error(`Error fetching API keys: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Internal server error" });
+    }
+  });
+
+  // Revoke an API key (admin only)
+  fastify.delete("/api/keys/:id", async (request, reply) => {
+    try {
+      // Additional admin authentication should be implemented here
+
+      const { id } = request.params;
+
+      const updated = await db(models.ApiKey.tableName)
+        .where({ id })
+        .update({ is_active: false });
+
+      if (updated === 0) {
+        return reply
+          .code(404)
+          .send({ success: false, message: "API key not found" });
+      }
+
+      fastify.log.info(`API key with ID ${id} has been revoked`);
+
+      return { success: true, message: "API key revoked successfully" };
+    } catch (err) {
+      fastify.log.error(`Error revoking API key: ${err.message}`);
+      return reply
+        .code(500)
+        .send({ success: false, message: "Failed to revoke API key" });
+    }
+  });
+});
+
+// Example helper function to send encrypted updates to clients
+async function sendEncryptedUpdate(clientId, data) {
+  try {
+    const connection = models.ClientConnection.getConnection(clientId);
+
+    if (!connection) {
+      fastify.log.warn(
+        `Cannot send update to client ${clientId}: Client not connected`
+      );
+      return false;
+    }
+
+    const encryptedData = encryptionUtils.encrypt(JSON.stringify(data));
+    connection.socket.send(
+      JSON.stringify({
+        encrypted: true,
+        data: encryptedData,
+      })
+    );
+
+    fastify.log.debug(`Sent encrypted update to client ${clientId}`);
+    return true;
+  } catch (err) {
+    fastify.log.error(
+      `Error sending encrypted update to client ${clientId}: ${err.message}`
+    );
+    return false;
+  }
 }
 
-// Fungsi untuk menghasilkan API Key acak
-function generateApiKey(length = 32) {
-  return crypto.randomBytes(length).toString("base64").replace(/[+/=]/g, "");
-}
-
-// Fungsi untuk mengatur tanggal kedaluwarsa (default 24 jam)
-function getExpiryDate(hours = 24) {
-  const date = new Date();
-  date.setHours(date.getHours() + hours);
-  return date;
-}
-
+// Server startup
 async function startServer() {
   try {
-    // Konfigurasi koneksi database
-    const dbConfig = {
-      host: process.env.DB_HOST || "localhost",
-      user: process.env.DB_USER || "root",
-      password: process.env.DB_PASSWORD || "",
-      database: process.env.DB_NAME || "all_articles",
-      port: parseInt(process.env.DB_PORT || "3306"),
-    };
+    // Set up scheduled tasks
+    setupScheduledTasks();
 
-    console.log("Menghubungkan ke database dengan konfigurasi:", {
-      ...dbConfig,
-      password: dbConfig.password
-        ? "[PASSWORD DIATUR]"
-        : "[TIDAK ADA PASSWORD]",
-    });
-
-    // Koneksi ke Database
-    const db = await mysql.createConnection(dbConfig);
-    console.log("Koneksi database berhasil!");
-
-    // Memeriksa dan menghasilkan API Key jika belum ada
-    let apiKey;
-    try {
-      const [apiKeyRow] = await db.execute(
-        "SELECT * FROM system_settings WHERE setting_key = 'api_key'"
-      );
-
-      if (apiKeyRow.length === 0) {
-        // Jika tidak ada API Key, buat yang baru
-        apiKey = generateApiKey();
-        await db.execute(
-          "INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?)",
-          ["api_key", apiKey]
-        );
-        console.log("API Key baru dibuat dan disimpan ke database");
-      } else {
-        apiKey = apiKeyRow[0].setting_value;
-        console.log("API Key yang sudah ada dimuat dari database");
-      }
-    } catch (error) {
-      console.error("Kesalahan saat mengakses tabel system_settings:", error);
-
-      // Jika tabel tidak ada, coba buat tabelnya
-      try {
-        await db.execute(`
-          CREATE TABLE IF NOT EXISTS system_settings (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            setting_key VARCHAR(50) NOT NULL UNIQUE,
-            setting_value TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-          )
-        `);
-
-        // Buat API Key baru dan simpan
-        apiKey = generateApiKey();
-        await db.execute(
-          "INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?)",
-          ["api_key", apiKey]
-        );
-        console.log("Tabel system_settings dibuat dan API Key baru disimpan");
-      } catch (createError) {
-        console.error("Gagal membuat tabel system_settings:", createError);
-        apiKey = process.env.API_KEY || generateApiKey();
-        console.log(
-          "Menggunakan API Key dari variabel lingkungan atau yang dibuat secara runtime"
-        );
-      }
-    }
-
-    // Mendaftarkan Plugin JWT
-    const jwtSecret =
-      process.env.JWT_SECRET || "urbansiana_jwt_secret_key_development_only";
-    fastify.register(FastifyJWT, {
-      secret: jwtSecret,
-      sign: {
-        expiresIn: "1d", // Token berlaku selama 1 hari
-      },
-    });
-
-    // Mendaftarkan Plugin Rate Limit
-    fastify.register(FastifyRateLimit, {
-      max: parseInt(process.env.RATE_LIMIT_MAX || "100"),
-      timeWindow: process.env.RATE_LIMIT_WINDOW || "1 minute",
-      errorResponseBuilder: () => {
-        return { error: "Terlalu banyak request, coba lagi nanti" };
-      },
-    });
-
-    // Mendaftarkan Plugin CORS
-    fastify.register(FastifyCors, {
-      origin: process.env.CORS_ORIGIN || "https://urbansiana.id",
-      methods: ["GET", "POST"],
-      credentials: true,
-    });
-
-    // Middleware untuk verifikasi token JWT
-    fastify.decorate("authenticate", async (request, reply) => {
-      try {
-        await request.jwtVerify();
-
-        // Periksa apakah token masih valid di database
-        const [tokenRows] = await db.execute(
-          "SELECT * FROM user_tokens WHERE token = ? AND expires_at > NOW()",
-          [request.headers.authorization.replace("Bearer ", "")]
-        );
-
-        if (tokenRows.length === 0) {
-          throw new Error("Token tidak valid atau sudah kedaluwarsa");
-        }
-
-        // Tambahkan informasi token ke request
-        request.userToken = tokenRows[0];
-      } catch (err) {
-        reply.status(401).send({ error: "Tidak terautentikasi" });
-      }
-    });
-
-    // Middleware API Key
-    fastify.addHook("onRequest", async (request, reply) => {
-      // Lewati pengecekan API key pada rute root dan auth
-      if (
-        request.routerPath === "/" ||
-        request.routerPath.startsWith("/auth")
-      ) {
-        return;
-      }
-
-      const requestApiKey = request.headers["x-api-key"];
-
-      if (!apiKey || !requestApiKey || requestApiKey !== apiKey) {
-        return reply
-          .status(401)
-          .send({ error: "Unauthorized: API Key Tidak Valid" });
-      }
-    });
-
-    // === Rute Root (/) ===
-    fastify.get("/", async (request, reply) => {
-      return reply.send({
-        message: "API Urbansiana berjalan dengan baik",
-        status: "online",
-        version: "1.0.0",
-        documentation:
-          "Gunakan endpoint /categories atau /articles untuk mengakses data",
-      });
-    });
-
-    // === Pengelolaan Token ===
-
-    // Fungsi untuk membuat dan menyimpan token baru
-    async function createAndSaveToken(userId, expiryHours = 24) {
-      const token = fastify.jwt.sign({
-        id: userId,
-        timestamp: Date.now(), // Tambahkan timestamp untuk memastikan token selalu unik
-      });
-
-      const expiryDate = getExpiryDate(expiryHours);
-
-      // Simpan token ke database
-      await db.execute(
-        "INSERT INTO user_tokens (user_id, token, expires_at) VALUES (?, ?, ?)",
-        [userId, token, expiryDate]
-      );
-
-      return {
-        token,
-        expires_at: expiryDate,
-      };
-    }
-
-    // Fungsi untuk membersihkan token yang sudah tidak valid
-    async function cleanupExpiredTokens() {
-      try {
-        const [result] = await db.execute(
-          "DELETE FROM user_tokens WHERE expires_at < NOW()"
-        );
-        console.log(
-          `${result.affectedRows} token kedaluwarsa telah dibersihkan`
-        );
-      } catch (error) {
-        console.error("Gagal membersihkan token kedaluwarsa:", error);
-      }
-    }
-
-    // Jadwalkan pembersihan token secara berkala (setiap jam)
-    setInterval(cleanupExpiredTokens, 60 * 60 * 1000);
-
-    // Panggil pembersihan saat server mulai
-    cleanupExpiredTokens();
-
-    // === API untuk Kategori ===
-
-    // **1. API Mendapatkan Semua Kategori**
-    fastify.get("/categories", async (request, reply) => {
-      try {
-        const [rows] = await db.execute(
-          "SELECT * FROM categories ORDER BY name ASC"
-        );
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil kategori" });
-      }
-    });
-
-    // **2. API Mendapatkan Kategori Berdasarkan ID**
-    fastify.get("/categories/:id", async (request, reply) => {
-      try {
-        const { id } = request.params;
-        const [rows] = await db.execute(
-          "SELECT * FROM categories WHERE id = ?",
-          [id]
-        );
-
-        if (rows.length === 0) {
-          return reply.status(404).send({ error: "Kategori tidak ditemukan" });
-        }
-
-        return reply.send({ data: rows[0] });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil kategori" });
-      }
-    });
-
-    // **3. API Mendapatkan Artikel Berdasarkan Kategori**
-    fastify.get("/categories/:id/articles", async (request, reply) => {
-      try {
-        const { id } = request.params;
-        const [categoryResult] = await db.execute(
-          "SELECT * FROM categories WHERE id = ?",
-          [id]
-        );
-
-        if (categoryResult.length === 0) {
-          return reply.status(404).send({ error: "Kategori tidak ditemukan" });
-        }
-
-        const [rows] = await db.execute(
-          "SELECT a.* FROM articles a WHERE a.category_id = ? ORDER BY a.date_published DESC",
-          [id]
-        );
-
-        return reply.send({
-          category: categoryResult[0],
-          data: rows,
-        });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil artikel" });
-      }
-    });
-
-    // === API untuk Artikel ===
-
-    // **4. API Mendapatkan Semua Artikel**
-    fastify.get("/articles", async (request, reply) => {
-      try {
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           ORDER BY a.date_published DESC`
-        );
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil artikel" });
-      }
-    });
-
-    // **5. API Mendapatkan Artikel Berdasarkan ID**
-    fastify.get("/articles/:id", async (request, reply) => {
-      try {
-        const { id } = request.params;
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           WHERE a.id = ?`,
-          [id]
-        );
-
-        if (rows.length === 0) {
-          return reply.status(404).send({ error: "Artikel tidak ditemukan" });
-        }
-
-        return reply.send({ data: rows[0] });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil artikel" });
-      }
-    });
-
-    // **6. API Mendapatkan Artikel Berdasarkan Slug**
-    fastify.get("/articles/slug/:slug", async (request, reply) => {
-      try {
-        const { slug } = request.params;
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           WHERE a.slug = ?`,
-          [slug]
-        );
-
-        if (rows.length === 0) {
-          return reply.status(404).send({ error: "Artikel tidak ditemukan" });
-        }
-
-        return reply.send({ data: rows[0] });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal mengambil artikel" });
-      }
-    });
-
-    // **7. API Mendapatkan Artikel Berdasarkan Posisi**
-    fastify.get("/positions/:position", async (request, reply) => {
-      try {
-        const { position } = request.params;
-
-        // Validasi posisi
-        const validPositions = ["news_list", "sub_headline", "headline"];
-        if (!validPositions.includes(position)) {
-          return reply.status(400).send({
-            error:
-              "Posisi tidak valid. Gunakan: news_list, sub_headline, atau headline",
-          });
-        }
-
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           JOIN article_positions ap ON a.id = ap.article_id 
-           WHERE ap.position = ? 
-           ORDER BY a.date_published DESC`,
-          [position]
-        );
-
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply
-          .status(500)
-          .send({ error: "Gagal mengambil artikel berdasarkan posisi" });
-      }
-    });
-
-    // **8. API Mendapatkan Artikel Berdasarkan Kategori dan Posisi**
-    fastify.get(
-      "/categories/:categoryId/positions/:position",
-      async (request, reply) => {
-        try {
-          const { categoryId, position } = request.params;
-
-          // Validasi posisi
-          const validPositions = ["news_list", "sub_headline", "headline"];
-          if (!validPositions.includes(position)) {
-            return reply.status(400).send({
-              error:
-                "Posisi tidak valid. Gunakan: news_list, sub_headline, atau headline",
-            });
-          }
-
-          const [rows] = await db.execute(
-            `SELECT a.*, c.name as category_name 
-             FROM articles a 
-             JOIN categories c ON a.category_id = c.id 
-             JOIN article_positions ap ON a.id = ap.article_id 
-             WHERE ap.position = ? AND ap.category_id = ? 
-             ORDER BY a.date_published DESC`,
-            [position, categoryId]
-          );
-
-          return reply.send({ data: rows });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({
-            error: "Gagal mengambil artikel berdasarkan kategori dan posisi",
-          });
-        }
-      }
-    );
-
-    // **9. API Mendapatkan Artikel Terbaru**
-    fastify.get("/articles/latest", async (request, reply) => {
-      try {
-        const limit = parseInt(request.query.limit || "10");
-
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           ORDER BY a.date_published DESC
-           LIMIT ?`,
-          [limit]
-        );
-
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply
-          .status(500)
-          .send({ error: "Gagal mengambil artikel terbaru" });
-      }
-    });
-
-    // **10. API Mencari Artikel**
-    fastify.get("/articles/search", async (request, reply) => {
-      try {
-        const { query } = request.query;
-
-        if (!query || query.trim() === "") {
-          return reply
-            .status(400)
-            .send({ error: "Parameter query pencarian diperlukan" });
-        }
-
-        const searchTerm = `%${query}%`;
-
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           WHERE a.title LIKE ? OR a.content LIKE ? OR a.description LIKE ?
-           ORDER BY a.date_published DESC`,
-          [searchTerm, searchTerm, searchTerm]
-        );
-
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply
-          .status(500)
-          .send({ error: "Gagal melakukan pencarian artikel" });
-      }
-    });
-
-    // **11. API Mendapatkan Artikel Terkait**
-    fastify.get("/articles/:id/related", async (request, reply) => {
-      try {
-        const { id } = request.params;
-        const limit = parseInt(request.query.limit || "5");
-
-        // Pertama, dapatkan data artikel yang diminta
-        const [article] = await db.execute(
-          "SELECT * FROM articles WHERE id = ?",
-          [id]
-        );
-
-        if (article.length === 0) {
-          return reply.status(404).send({ error: "Artikel tidak ditemukan" });
-        }
-
-        // Mendapatkan artikel dari kategori yang sama, kecuali artikel itu sendiri
-        const [rows] = await db.execute(
-          `SELECT a.*, c.name as category_name 
-           FROM articles a 
-           JOIN categories c ON a.category_id = c.id 
-           WHERE a.category_id = ? AND a.id != ? 
-           ORDER BY a.date_published DESC
-           LIMIT ?`,
-          [article[0].category_id, id, limit]
-        );
-
-        return reply.send({ data: rows });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply
-          .status(500)
-          .send({ error: "Gagal mengambil artikel terkait" });
-      }
-    });
-
-    // === API untuk Autentikasi dan Manajemen Token ===
-
-    // API Login (untuk mendapatkan token)
-    fastify.post("/auth/login", async (request, reply) => {
-      try {
-        const { username, password } = request.body;
-
-        if (!username || !password) {
-          return reply
-            .status(400)
-            .send({ error: "Username dan password diperlukan" });
-        }
-
-        // Cari pengguna di database
-        const [users] = await db.execute(
-          "SELECT * FROM users WHERE username = ?",
-          [username]
-        );
-
-        if (users.length === 0) {
-          return reply
-            .status(401)
-            .send({ error: "Username atau password tidak valid" });
-        }
-
-        const user = users[0];
-
-        // Verifikasi password (dalam kasus nyata gunakan bcrypt atau library serupa)
-        // Contoh sederhana, asumsi password di database sudah di-hash
-        if (user.password !== password) {
-          // Di aplikasi sesungguhnya gunakan bcrypt.compare()
-          return reply
-            .status(401)
-            .send({ error: "Username atau password tidak valid" });
-        }
-
-        // Hapus token lama untuk user ini jika sudah ada banyak
-        await db.execute(
-          "DELETE FROM user_tokens WHERE user_id = ? AND created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)",
-          [user.id]
-        );
-
-        // Buat token baru dan simpan ke database
-        const tokenData = await createAndSaveToken(user.id);
-
-        return reply.send({
-          success: true,
-          token: tokenData.token,
-          expires_at: tokenData.expires_at,
-          user: {
-            id: user.id,
-            username: user.username,
-            role: user.role,
-          },
-        });
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({ error: "Gagal melakukan login" });
-      }
-    });
-
-    // API Perbarui Token
-    fastify.post(
-      "/auth/refresh-token",
-      { preHandler: fastify.authenticate },
-      async (request, reply) => {
-        try {
-          const userId = request.user.id;
-          const currentToken = request.headers.authorization.replace(
-            "Bearer ",
-            ""
-          );
-
-          // Hapus token saat ini dari database
-          await db.execute("DELETE FROM user_tokens WHERE token = ?", [
-            currentToken,
-          ]);
-
-          // Buat token baru
-          const tokenData = await createAndSaveToken(userId);
-
-          return reply.send({
-            success: true,
-            token: tokenData.token,
-            expires_at: tokenData.expires_at,
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({ error: "Gagal memperbarui token" });
-        }
-      }
-    );
-
-    // API Logout (invalidate token)
-    fastify.post(
-      "/auth/logout",
-      { preHandler: fastify.authenticate },
-      async (request, reply) => {
-        try {
-          const currentToken = request.headers.authorization.replace(
-            "Bearer ",
-            ""
-          );
-
-          // Hapus token dari database
-          await db.execute("DELETE FROM user_tokens WHERE token = ?", [
-            currentToken,
-          ]);
-
-          return reply.send({
-            success: true,
-            message: "Berhasil logout",
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({ error: "Gagal melakukan logout" });
-        }
-      }
-    );
-
-    // API Verifikasi Token
-    fastify.get("/auth/verify", async (request, reply) => {
-      try {
-        const token = request.headers.authorization?.replace("Bearer ", "");
-
-        if (!token) {
-          return reply.status(400).send({
-            valid: false,
-            error: "Token tidak disediakan",
-          });
-        }
-
-        try {
-          // Verifikasi token JWT
-          const decoded = fastify.jwt.verify(token);
-
-          // Periksa apakah token ada di database dan masih berlaku
-          const [tokenRows] = await db.execute(
-            "SELECT * FROM user_tokens WHERE token = ? AND expires_at > NOW()",
-            [token]
-          );
-
-          if (tokenRows.length === 0) {
-            return reply.send({
-              valid: false,
-              error: "Token tidak valid atau sudah kedaluwarsa",
-            });
-          }
-
-          // Dapatkan info user
-          const [userRows] = await db.execute(
-            "SELECT id, username, role FROM users WHERE id = ?",
-            [decoded.id]
-          );
-
-          if (userRows.length === 0) {
-            return reply.send({
-              valid: false,
-              error: "Pengguna tidak ditemukan",
-            });
-          }
-
-          return reply.send({
-            valid: true,
-            user: userRows[0],
-            expires_at: tokenRows[0].expires_at,
-          });
-        } catch (error) {
-          return reply.send({
-            valid: false,
-            error: "Token tidak valid",
-          });
-        }
-      } catch (error) {
-        fastify.log.error(error);
-        return reply.status(500).send({
-          valid: false,
-          error: "Gagal memverifikasi token",
-        });
-      }
-    });
-
-    // API Mendapatkan API Key (hanya untuk admin)
-    fastify.get(
-      "/auth/api-key",
-      { preHandler: fastify.authenticate },
-      async (request, reply) => {
-        try {
-          // Verifikasi role admin
-          if (request.user.role !== "admin") {
-            return reply
-              .status(403)
-              .send({ error: "Akses ditolak: Hanya admin yang diizinkan" });
-          }
-
-          return reply.send({
-            api_key: apiKey,
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({ error: "Gagal mendapatkan API Key" });
-        }
-      }
-    );
-
-    // API Regenerasi API Key (hanya untuk admin)
-    fastify.post(
-      "/auth/regenerate-api-key",
-      { preHandler: fastify.authenticate },
-      async (request, reply) => {
-        try {
-          // Verifikasi role admin
-          if (request.user.role !== "admin") {
-            return reply
-              .status(403)
-              .send({ error: "Akses ditolak: Hanya admin yang diizinkan" });
-          }
-
-          // Generate API Key baru
-          const newApiKey = generateApiKey();
-
-          // Simpan ke database
-          await db.execute(
-            "UPDATE system_settings SET setting_value = ? WHERE setting_key = 'api_key'",
-            [newApiKey]
-          );
-
-          // Update variabel lokal
-          apiKey = newApiKey;
-
-          return reply.send({
-            success: true,
-            message: "API Key berhasil diperbarui",
-            api_key: newApiKey,
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({ error: "Gagal memperbarui API Key" });
-        }
-      }
-    );
-
-    // === Rute Dashboard (Memerlukan Authentication) ===
-
-    // Middleware untuk rute dashboard
-    const dashboardAuth = async (request, reply) => {
-      try {
-        await request.jwtVerify();
-
-        // Validasi apakah pengguna memiliki peran admin
-        if (request.user.role !== "admin") {
-          return reply
-            .status(403)
-            .send({ error: "Akses ditolak: Hanya admin yang diizinkan" });
-        }
-
-        // Verifikasi token di database
-        const token = request.headers.authorization.replace("Bearer ", "");
-        const [tokenRows] = await db.execute(
-          "SELECT * FROM user_tokens WHERE token = ? AND expires_at > NOW()",
-          [token]
-        );
-
-        if (tokenRows.length === 0) {
-          return reply.status(401).send({
-            error: "Token tidak valid atau sudah kedaluwarsa",
-            token_expired: true,
-          });
-        }
-      } catch (err) {
-        return reply.status(401).send({ error: "Tidak terautentikasi" });
-      }
-    };
-
-    // Dashboard Statistics
-    fastify.get(
-      "/dashboard/stats",
-      { preHandler: dashboardAuth },
-      async (request, reply) => {
-        try {
-          // Hitung total artikel
-          const [totalArticles] = await db.execute(
-            "SELECT COUNT(*) as total FROM articles"
-          );
-
-          // Hitung total kategori
-          const [totalCategories] = await db.execute(
-            "SELECT COUNT(*) as total FROM categories"
-          );
-
-          // Artikel per kategori
-          const [articlesByCategory] = await db.execute(`
-          SELECT c.name, COUNT(a.id) as count 
-          FROM categories c 
-          LEFT JOIN articles a ON c.id = a.category_id 
-          GROUP BY c.id 
-          ORDER BY count DESC
-        `);
-
-          // Artikel terbaru
-          const [latestArticles] = await db.execute(`
-          SELECT a.id, a.title, a.date_published, c.name as category_name
-          FROM articles a
-          JOIN categories c ON a.category_id = c.id
-          ORDER BY a.date_published DESC
-          LIMIT 5
-        `);
-
-          return reply.send({
-            totalArticles: totalArticles[0].total,
-            totalCategories: totalCategories[0].total,
-            articlesByCategory,
-            latestArticles,
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply
-            .status(500)
-            .send({ error: "Gagal mengambil statistik dashboard" });
-        }
-      }
-    );
-
-    // API untuk mengelola token aktif (hanya admin)
-    fastify.get(
-      "/dashboard/active-tokens",
-      { preHandler: dashboardAuth },
-      async (request, reply) => {
-        try {
-          const [tokens] = await db.execute(`
-            SELECT ut.id, ut.user_id, ut.created_at, ut.expires_at, u.username 
-            FROM user_tokens ut
-            JOIN users u ON ut.user_id = u.id
-            WHERE ut.expires_at > NOW()
-            ORDER BY ut.created_at DESC
-          `);
-
-          return reply.send({ data: tokens });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply
-            .status(500)
-            .send({ error: "Gagal mengambil data token aktif" });
-        }
-      }
-    );
-
-    // API untuk menghapus token (hanya admin)
-    fastify.delete(
-      "/dashboard/tokens/:id",
-      { preHandler: dashboardAuth },
-      async (request, reply) => {
-        try {
-          const { id } = request.params;
-
-          const [result] = await db.execute(
-            "DELETE FROM user_tokens WHERE id = ?",
-            [id]
-          );
-
-          if (result.affectedRows === 0) {
-            return reply.status(404).send({ error: "Token tidak ditemukan" });
-          }
-
-          return reply.send({
-            success: true,
-            message: "Token berhasil dihapus",
-          });
-        } catch (error) {
-          fastify.log.error(error);
-          return reply.status(500).send({ error: "Gagal menghapus token" });
-        }
-      }
-    );
-
-    // === Penanganan Kesalahan ===
-
-    // Penanganan Error
-    fastify.setErrorHandler((error, request, reply) => {
-      // Log error dan kirim respon yang sesuai
-      fastify.log.error(error);
-
-      // Jika error validasi
-      if (error.validation) {
-        return reply
-          .status(400)
-          .send({ error: "Validasi gagal", details: error.validation });
-      }
-
-      // Jika error JWT
-      if (
-        error.code === "FST_JWT_NO_AUTHORIZATION_IN_HEADER" ||
-        error.code === "FST_JWT_AUTHORIZATION_TOKEN_EXPIRED" ||
-        error.code === "FST_JWT_AUTHORIZATION_TOKEN_INVALID"
-      ) {
-        return reply
-          .status(401)
-          .send({ error: "Tidak terautentikasi", token_expired: true });
-      }
-
-      // Untuk error lainnya
-      return reply
-        .status(500)
-        .send({ error: "Terjadi kesalahan internal server" });
-    });
-
-    // Tentukan port dan host
+    // Start the server
     const port = process.env.PORT || 3000;
     const host = process.env.HOST || "0.0.0.0";
 
-    // Mulai server
     await fastify.listen({ port, host });
-    console.log(`Server berjalan di ${host}:${port}`);
+    fastify.log.info(`Server is running on ${host}:${port}`);
+
+    // Generate initial API key if none exists
+    const keysCount = await db("api_keys").count("id as count").first();
+
+    if (keysCount.count === 0) {
+      fastify.log.info("No API keys found. Generating initial API key...");
+      const newKey = await models.ApiKey.rotateKeys();
+      fastify.log.info(`Initial API key generated: ${newKey.key}`);
+      fastify.log.info(
+        `IMPORTANT: Store this key securely as it won't be shown again!`
+      );
+    }
   } catch (err) {
-    console.error("Error saat memulai server:", err);
+    fastify.log.error(`Server startup failed: ${err.message}`);
     process.exit(1);
   }
 }
 
-// Memulai server
+// Start the server
 startServer();
+
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  fastify.log.info("SIGTERM received, shutting down gracefully");
+  await fastify.close();
+  await db.destroy();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  fastify.log.info("SIGINT received, shutting down gracefully");
+  await fastify.close();
+  await db.destroy();
+  process.exit(0);
+});
+
+export { fastify, encryptionUtils, models };
