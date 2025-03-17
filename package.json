@@ -1,11 +1,19 @@
 {
   "type": "module",
   "dependencies": {
-    "@fastify/cors": "^9.0.0",
+    "@fastify/auth": "^5.0.2",
+    "@fastify/cors": "^11.0.0",
     "@fastify/jwt": "^7.0.0",
     "@fastify/rate-limit": "^7.3.0",
+    "@fastify/websocket": "^11.0.2",
+    "bcrypt": "^5.1.1",
     "dotenv": "^16.4.7",
-    "fastify": "^4.29.0",
-    "mysql2": "^3.6.0"
+    "fastify": "^5.2.1",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "mysql2": "^3.13.0",
+    "node-cron": "^3.0.3",
+    "pino-pretty": "^13.0.0",
+    "slugify": "^1.6.6"
   }
 }
