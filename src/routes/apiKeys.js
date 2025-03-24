@@ -7,11 +7,13 @@
  * @param {Object} fastify - Instansi fastify
  * @param {Object} options - Opsi konfigurasi
  */
-export function registerApiKeyRoutes(fastify, options) {
+export async function registerApiKeyRoutes(fastify, options) {
   const { models, db, encryptionUtils } = fastify;
 
   // Mendapatkan semua API keys (khusus admin)
-  fastify.get("/api/keys", {
+  fastify.route({
+    method: "GET",
+    url: "/api/keys",
     schema: {
       tags: ["api-keys"],
       summary: "Mendapatkan daftar API keys",
@@ -39,7 +41,7 @@ export function registerApiKeyRoutes(fastify, options) {
         },
       },
     },
-    preHandler: fastify.auth([fastify.verifyAdmin]),
+    preHandler: fastify.verifyAdmin,
     handler: async (request, reply) => {
       try {
         const keys = await db(models.ApiKey.tableName)
@@ -59,7 +61,9 @@ export function registerApiKeyRoutes(fastify, options) {
   });
 
   // Membuat API key baru
-  fastify.post("/api/keys", {
+  fastify.route({
+    method: "POST",
+    url: "/api/keys",
     schema: {
       tags: ["api-keys"],
       summary: "Membuat API key baru",
@@ -93,7 +97,7 @@ export function registerApiKeyRoutes(fastify, options) {
         },
       },
     },
-    preHandler: fastify.auth([fastify.verifyAdmin]),
+    preHandler: fastify.verifyAdmin,
     handler: async (request, reply) => {
       try {
         const { name, expires_in_days } = request.body;
@@ -146,7 +150,9 @@ export function registerApiKeyRoutes(fastify, options) {
   });
 
   // Menonaktifkan/mencabut API key
-  fastify.delete("/api/keys/:id", {
+  fastify.route({
+    method: "DELETE",
+    url: "/api/keys/:id",
     schema: {
       tags: ["api-keys"],
       summary: "Menonaktifkan API key",
@@ -168,7 +174,7 @@ export function registerApiKeyRoutes(fastify, options) {
         },
       },
     },
-    preHandler: fastify.auth([fastify.verifyAdmin]),
+    preHandler: fastify.verifyAdmin,
     handler: async (request, reply) => {
       try {
         const { id } = request.params;
@@ -211,7 +217,9 @@ export function registerApiKeyRoutes(fastify, options) {
   });
 
   // Rotasi API key (menonaktifkan key lama dan membuat key baru dengan properti yang sama)
-  fastify.post("/api/keys/:id/rotate", {
+  fastify.route({
+    method: "POST",
+    url: "/api/keys/:id/rotate",
     schema: {
       tags: ["api-keys"],
       summary: "Rotasi API key",
@@ -242,7 +250,7 @@ export function registerApiKeyRoutes(fastify, options) {
         },
       },
     },
-    preHandler: fastify.auth([fastify.verifyAdmin]),
+    preHandler: fastify.verifyAdmin,
     handler: async (request, reply) => {
       try {
         const { id } = request.params;
@@ -285,7 +293,9 @@ export function registerApiKeyRoutes(fastify, options) {
   });
 
   // Memeriksa validitas dan status API key
-  fastify.get("/api/keys/verify", {
+  fastify.route({
+    method: "GET",
+    url: "/api/keys/verify",
     schema: {
       tags: ["api-keys"],
       summary: "Verifikasi API key",
@@ -338,7 +348,9 @@ export function registerApiKeyRoutes(fastify, options) {
   });
 
   // Mendapatkan key yang aktif saat ini
-  fastify.get("/api/keys/current", {
+  fastify.route({
+    method: "GET",
+    url: "/api/keys/current",
     schema: {
       tags: ["api-keys"],
       summary: "Mendapatkan API key yang aktif",
@@ -362,7 +374,7 @@ export function registerApiKeyRoutes(fastify, options) {
         },
       },
     },
-    preHandler: fastify.auth([fastify.verifyAdmin]),
+    preHandler: fastify.verifyAdmin,
     handler: async (request, reply) => {
       try {
         // Dapatkan key aktif terbaru

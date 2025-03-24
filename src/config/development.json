@@ -1,0 +1,28 @@
+{
+  "server": {
+    "port": 3000,
+    "host": "0.0.0.0"
+  },
+  "database": {
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "Gayu251005777",
+    "database": "urbansiana"
+  },
+  "security": {
+    "allowedOrigins": [
+      "http://localhost:3000",
+      "http://localhost:8080",
+      "*.urbansiana.local",
+      "https://www.urbansiana.com",
+      "https://urbansiana.com"
+    ],
+    "allowedIPs": ["127.0.0.1", "192.168.1.0/24"],
+    "allowServerToServer": true
+  },
+  "logging": {
+    "level": "debug",
+    "prettyPrint": true
+  }
+}

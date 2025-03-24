@@ -1,14 +1,27 @@
 import crypto from "crypto";
 import { fastify } from "../config/server.js";
 
+// Import models yang diperlukan
+import { models } from "../models/index.js";
+import * as encryptionUtils from "../config/encryption.js";
+
 /**
- * Middleware untuk autentikasi WebSocket
- * @param {Object} connection - Objek koneksi WebSocket
- * @param {Object} request - Objek request HTTP
- * @returns {Promise<boolean>} - Status autentikasi
+ *
+ * @param {Object} fastify
+ * @param {Object} connection
+ * @param {Object} request
+ * @returns {Promise<boolean>}
  */
 async function wsAuthMiddleware(fastify, connection, request) {
   try {
+    // Periksa apakah connection dan socket ada
+    if (!connection || !connection.socket) {
+      fastify.log.warn(
+        `Autentikasi WebSocket gagal: Objek koneksi tidak valid`
+      );
+      return false;
+    }
+
     const { socket } = connection;
     const apiKey = request.headers["x-api-key"];
 
@@ -19,6 +32,25 @@ async function wsAuthMiddleware(fastify, connection, request) {
           type: "error",
           message:
             "Autentikasi diperlukan. Silakan berikan API key yang valid.",
+        })
+      );
+      socket.close();
+      return false;
+    }
+
+    // Periksa apakah models.ApiKey tersedia
+    if (
+      !models ||
+      !models.ApiKey ||
+      typeof models.ApiKey.findValidKey !== "function"
+    ) {
+      fastify.log.error(
+        `Autentikasi WebSocket gagal: Model ApiKey tidak tersedia`
+      );
+      socket.send(
+        JSON.stringify({
+          type: "error",
+          message: "Kesalahan sistem. Silakan coba lagi nanti.",
         })
       );
       socket.close();
@@ -42,7 +74,9 @@ async function wsAuthMiddleware(fastify, connection, request) {
     return true;
   } catch (err) {
     fastify.log.error(`Error autentikasi WebSocket: ${err.message}`);
-    connection.socket.close();
+    if (connection && connection.socket) {
+      connection.socket.close();
+    }
     return false;
   }
 }
@@ -55,6 +89,17 @@ async function wsAuthMiddleware(fastify, connection, request) {
  */
 function kirimPesanTerenkripsi(connection, data) {
   try {
+    // Periksa apakah encryptionUtils dan koneksi valid
+    if (
+      !encryptionUtils ||
+      !encryptionUtils.encrypt ||
+      !connection ||
+      !connection.socket
+    ) {
+      console.error("Enkripsi gagal: modul enkripsi atau koneksi tidak valid");
+      return false;
+    }
+
     const encryptedData = encryptionUtils.encrypt(JSON.stringify(data));
     connection.socket.send(
       JSON.stringify({
@@ -64,6 +109,7 @@ function kirimPesanTerenkripsi(connection, data) {
     );
     return true;
   } catch (err) {
+    console.error(`Error saat mengirim pesan terenkripsi: ${err.message}`);
     return false;
   }
 }
@@ -74,11 +120,18 @@ function kirimPesanTerenkripsi(connection, data) {
  */
 async function dapatkanApiKeyTerbaru() {
   try {
+    // Periksa apakah models.ApiKey tersedia
+    if (!models || !models.ApiKey || !models.ApiKey.tableName) {
+      console.error("Model ApiKey tidak tersedia");
+      return null;
+    }
+
     // Dapatkan API key aktif terbaru
     const db =
       models.ApiKey.tableName._knex ||
       models.ApiKey.tableName.knex ||
       require("knex")();
+
     const apiKey = await db(models.ApiKey.tableName)
       .where({ is_active: true })
       .where("expires_at", ">", db.fn.now())
@@ -87,6 +140,7 @@ async function dapatkanApiKeyTerbaru() {
 
     return apiKey;
   } catch (err) {
+    console.error(`Error saat mendapatkan API key terbaru: ${err.message}`);
     return null;
   }
 }
@@ -96,6 +150,46 @@ async function dapatkanApiKeyTerbaru() {
  * @param {Object} fastify - Instance Fastify
  */
 export async function registerWebSocketRoutes(fastify) {
+  // Pastikan semua dependensi ada
+  if (!models || !models.ClientConnection) {
+    fastify.log.error(
+      "Models ClientConnection tidak tersedia. WebSocket routes tidak dapat didaftarkan."
+    );
+
+    // Inisialisasi models.ClientConnection jika belum ada
+    if (!models) {
+      global.models = {}; // Inisialisasi models sebagai objek global jika tidak ada
+    }
+
+    // Buat implementasi sederhana jika belum ada
+    models.ClientConnection = {
+      connections: new Map(),
+      addConnection: function (clientId, connection) {
+        this.connections.set(clientId, connection);
+        fastify.log.info(`Koneksi klien ${clientId} ditambahkan`);
+      },
+      removeConnection: function (clientId) {
+        this.connections.delete(clientId);
+        fastify.log.info(`Koneksi klien ${clientId} dihapus`);
+      },
+      broadcastMessage: function (message) {
+        let count = 0;
+        this.connections.forEach((conn) => {
+          try {
+            if (conn && conn.socket && conn.socket.readyState === 1) {
+              conn.socket.send(JSON.stringify(message));
+              count++;
+            }
+          } catch (err) {
+            fastify.log.error(`Error saat broadcast: ${err.message}`);
+          }
+        });
+        return count;
+      },
+    };
+  }
+
+  // Mendaftarkan satu plugin WebSocket dengan semua rute-rute WebSocket
   fastify.register(async function (fastify) {
     // Rute WebSocket utama
     fastify.get("/ws", { websocket: true }, async (connection, request) => {
@@ -112,7 +206,17 @@ export async function registerWebSocketRoutes(fastify) {
         const clientId = crypto.randomBytes(16).toString("hex");
 
         // Simpan koneksi
-        models.ClientConnection.addConnection(clientId, connection);
+        if (
+          models &&
+          models.ClientConnection &&
+          typeof models.ClientConnection.addConnection === "function"
+        ) {
+          models.ClientConnection.addConnection(clientId, connection);
+        } else {
+          fastify.log.warn(
+            "models.ClientConnection.addConnection tidak tersedia"
+          );
+        }
 
         // Kirim pesan selamat datang dengan ID klien (terenkripsi)
         const welcomeMessage = {
@@ -123,7 +227,17 @@ export async function registerWebSocketRoutes(fastify) {
           timestamp: new Date().toISOString(),
         };
 
-        kirimPesanTerenkripsi(connection, welcomeMessage);
+        if (encryptionUtils && encryptionUtils.encrypt) {
+          kirimPesanTerenkripsi(connection, welcomeMessage);
+        } else {
+          // Fallback jika enkripsi tidak tersedia
+          connection.socket.send(
+            JSON.stringify({
+              ...welcomeMessage,
+              message: "Koneksi berhasil dibuat (tidak terenkripsi)",
+            })
+          );
+        }
 
         // Tangani pesan masuk
         connection.socket.on("message", async (message) => {
@@ -131,7 +245,12 @@ export async function registerWebSocketRoutes(fastify) {
             const msgData = JSON.parse(message.toString());
 
             // Tangani pesan terenkripsi
-            if (msgData.encrypted && msgData.data) {
+            if (
+              msgData.encrypted &&
+              msgData.data &&
+              encryptionUtils &&
+              encryptionUtils.decrypt
+            ) {
               try {
                 // Dekripsi pesan
                 const decrypted = encryptionUtils.decrypt(msgData.data);
@@ -169,24 +288,28 @@ export async function registerWebSocketRoutes(fastify) {
                 fastify.log.error(
                   `Gagal mendekripsi pesan dari klien ${clientId}: ${decryptErr.message}`
                 );
-                connection.socket.send(
-                  JSON.stringify({
-                    type: "error",
-                    message: "Gagal mendekripsi pesan",
-                  })
-                );
+                if (connection && connection.socket) {
+                  connection.socket.send(
+                    JSON.stringify({
+                      type: "error",
+                      message: "Gagal mendekripsi pesan",
+                    })
+                  );
+                }
               }
             } else {
               // Tangani pesan tidak terenkripsi (bisa ditolak untuk keamanan)
               fastify.log.warn(
                 `Menerima pesan tidak terenkripsi dari klien ${clientId}`
               );
-              connection.socket.send(
-                JSON.stringify({
-                  type: "error",
-                  message: "Semua pesan harus dienkripsi",
-                })
-              );
+              if (connection && connection.socket) {
+                connection.socket.send(
+                  JSON.stringify({
+                    type: "error",
+                    message: "Semua pesan harus dienkripsi",
+                  })
+                );
+              }
             }
           } catch (msgErr) {
             fastify.log.error(
@@ -197,20 +320,29 @@ export async function registerWebSocketRoutes(fastify) {
 
         // Tangani penutupan koneksi
         connection.socket.on("close", () => {
-          models.ClientConnection.removeConnection(clientId);
+          if (
+            models &&
+            models.ClientConnection &&
+            typeof models.ClientConnection.removeConnection === "function"
+          ) {
+            models.ClientConnection.removeConnection(clientId);
+          }
         });
       } catch (err) {
         fastify.log.error(`Error koneksi WebSocket: ${err.message}`);
-        if (connection.socket.readyState === 1) {
-          // 1 = OPEN
+        if (
+          connection &&
+          connection.socket &&
+          connection.socket.readyState === 1
+        ) {
           connection.socket.close();
         }
       }
     });
 
-    // Endpoint khusus untuk meminta API key
+    // Endpoint khusus untuk meminta API key (dengan path yang berbeda untuk menghindari konflik)
     fastify.get(
-      "/ws/request-api-key",
+      "/api-key-ws", // Ubah dari "/ws/request-api-key" menjadi "/api-key-ws"
       { websocket: true },
       async (connection, request) => {
         try {
@@ -218,41 +350,61 @@ export async function registerWebSocketRoutes(fastify) {
           const clientId = crypto.randomBytes(16).toString("hex");
 
           // Simpan koneksi secara sementara
-          models.ClientConnection.addConnection(clientId, connection);
+          if (
+            models &&
+            models.ClientConnection &&
+            typeof models.ClientConnection.addConnection === "function"
+          ) {
+            models.ClientConnection.addConnection(clientId, connection);
+          }
 
           // Kirim pesan selamat datang
-          connection.socket.send(
-            JSON.stringify({
-              type: "system",
-              action: "api_key_request_ready",
-              message: "Siap menerima permintaan API key",
-              timestamp: new Date().toISOString(),
-            })
-          );
+          if (connection && connection.socket) {
+            connection.socket.send(
+              JSON.stringify({
+                type: "system",
+                action: "api_key_request_ready",
+                message: "Siap menerima permintaan API key",
+                timestamp: new Date().toISOString(),
+              })
+            );
+          }
 
           // Tangani pesan masuk
-          connection.socket.on("message", async (message) => {
-            try {
-              const msgData = JSON.parse(message.toString());
+          if (connection && connection.socket) {
+            connection.socket.on("message", async (message) => {
+              try {
+                const msgData = JSON.parse(message.toString());
 
-              if (msgData.type === "request_api_key") {
-                // Proses permintaan API key
-                await handleRequestApiKey(fastify, connection, clientId);
+                if (msgData.type === "request_api_key") {
+                  // Proses permintaan API key
+                  await handleRequestApiKey(fastify, connection, clientId);
+                }
+              } catch (msgErr) {
+                fastify.log.error(
+                  `Error memproses permintaan API key: ${msgErr.message}`
+                );
               }
-            } catch (msgErr) {
-              fastify.log.error(
-                `Error memproses permintaan API key: ${msgErr.message}`
-              );
-            }
-          });
+            });
 
-          // Tangani penutupan koneksi
-          connection.socket.on("close", () => {
-            models.ClientConnection.removeConnection(clientId);
-          });
+            // Tangani penutupan koneksi
+            connection.socket.on("close", () => {
+              if (
+                models &&
+                models.ClientConnection &&
+                typeof models.ClientConnection.removeConnection === "function"
+              ) {
+                models.ClientConnection.removeConnection(clientId);
+              }
+            });
+          }
         } catch (err) {
           fastify.log.error(`Error koneksi API key WebSocket: ${err.message}`);
-          if (connection.socket.readyState === 1) {
+          if (
+            connection &&
+            connection.socket &&
+            connection.socket.readyState === 1
+          ) {
             connection.socket.close();
           }
         }
@@ -278,14 +430,16 @@ async function handleRequestApiKey(fastify, connection, clientId) {
       fastify.log.warn(
         `Tidak ada API key aktif yang tersedia untuk klien ${clientId}`
       );
-      connection.socket.send(
-        JSON.stringify({
-          type: "error",
-          action: "api_key_response",
-          message: "Tidak ada API key aktif yang tersedia",
-          timestamp: new Date().toISOString(),
-        })
-      );
+      if (connection && connection.socket) {
+        connection.socket.send(
+          JSON.stringify({
+            type: "error",
+            action: "api_key_response",
+            message: "Tidak ada API key aktif yang tersedia",
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
       return;
     }
 
@@ -298,19 +452,36 @@ async function handleRequestApiKey(fastify, connection, clientId) {
       timestamp: new Date().toISOString(),
     };
 
-    kirimPesanTerenkripsi(connection, apiKeyResponse);
+    if (encryptionUtils && encryptionUtils.encrypt) {
+      kirimPesanTerenkripsi(connection, apiKeyResponse);
+    } else {
+      // Fallback tanpa enkripsi (tidak direkomendasikan untuk produksi)
+      if (connection && connection.socket) {
+        connection.socket.send(
+          JSON.stringify({
+            type: "system",
+            action: "api_key_response",
+            message:
+              "API key tidak dapat dikirim karena enkripsi tidak tersedia",
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
+    }
 
     fastify.log.info(`API key berhasil dikirim ke klien ${clientId}`);
   } catch (err) {
     fastify.log.error(`Error menangani permintaan API key: ${err.message}`);
-    connection.socket.send(
-      JSON.stringify({
-        type: "error",
-        action: "api_key_response",
-        message: "Gagal mendapatkan API key",
-        timestamp: new Date().toISOString(),
-      })
-    );
+    if (connection && connection.socket) {
+      connection.socket.send(
+        JSON.stringify({
+          type: "error",
+          action: "api_key_response",
+          message: "Gagal mendapatkan API key",
+          timestamp: new Date().toISOString(),
+        })
+      );
+    }
   }
 }
 
@@ -320,7 +491,14 @@ async function handleRequestApiKey(fastify, connection, clientId) {
  * @returns {number} - Jumlah klien yang menerima pesan
  */
 export function broadcastMessage(message) {
-  return models.ClientConnection.broadcastMessage(message);
+  if (
+    models &&
+    models.ClientConnection &&
+    typeof models.ClientConnection.broadcastMessage === "function"
+  ) {
+    return models.ClientConnection.broadcastMessage(message);
+  }
+  return 0;
 }
 
 // Ekspor fungsi tambahan yang mungkin berguna

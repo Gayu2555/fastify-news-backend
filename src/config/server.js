@@ -33,19 +33,10 @@ fastify.register(fastifyWebsocket, {
   options: { maxPayload: 1048576 },
 });
 
-// Register Auth plugin
+// Register Auth plugin dengan konfigurasi yang benar
 fastify.register(fastifyAuth);
 
-// Dekorasi untuk verifikasi admin
-fastify.decorate("verifyAdmin", async (request, reply) => {
-  // Implementasikan logika verifikasi admin di sini
-  // Contoh sederhana:
-  if (!request.user || !request.user.isAdmin) {
-    return reply.code(403).send({
-      success: false,
-      error: "Akses ditolak. Hanya admin yang diizinkan.",
-    });
-  }
-});
+// HAPUS registrasi verifyAdmin di sini
+// Pindahkan ke middleware/index.js
 
 export { fastify };

@@ -13,11 +13,33 @@ import crypto from "crypto";
  * @param {Object} encryptionUtils - Utilitas enkripsi/dekripsi
  */
 function setupScheduledTasks(fastify, models, db, encryptionUtils) {
+  // Periksa apakah parameter yang diperlukan telah disediakan
+  if (!fastify || !models || !db) {
+    console.error(
+      "Gagal menginisialisasi tugas terjadwal: Parameter tidak lengkap"
+    );
+    return;
+  }
+
+  // Validasi objek database
+  if (!db || typeof db.raw !== "function") {
+    console.error(
+      "Gagal menginisialisasi tugas terjadwal: Objek database tidak valid"
+    );
+    return;
+  }
+
   fastify.log.info("Menginisialisasi tugas terjadwal...");
 
-  // Rotasi API key setiap jam (terjadi pada awal jam)
+  // Membuat API key baru dan menonaktifkan yang lama setelah 10 menit
+  // Berjalan setiap jam
   nodeCron.schedule("0 * * * *", async () => {
     await rotateApiKeys(fastify, models, db);
+
+    // Set timeout untuk menonaktifkan key lama setelah 10 menit
+    setTimeout(async () => {
+      await deactivateOldApiKey(fastify, models, db);
+    }, 10 * 60 * 1000); // 10 menit dalam milidetik
   });
 
   // Membersihkan API key kadaluarsa setiap 6 jam
@@ -25,66 +47,183 @@ function setupScheduledTasks(fastify, models, db, encryptionUtils) {
     await cleanupExpiredApiKeys(fastify, models, db);
   });
 
+  // Membersihkan API key lama yang tidak digunakan setiap hari (pukul 00:30)
+  nodeCron.schedule("30 0 * * *", async () => {
+    await cleanupOldApiKeys(fastify, models, db);
+  });
+
   // Backup database sederhana setiap minggu (Minggu pukul 01:00)
   nodeCron.schedule("0 1 * * 0", async () => {
     await performDatabaseBackup(fastify, db);
   });
 
-  // Menghapus log lama setiap bulan (1st day at 02:00)
+  // Menghapus log lama setiap bulan (tanggal 1 pukul 02:00)
   nodeCron.schedule("0 2 1 * *", async () => {
     await cleanupOldLogs(fastify, db);
   });
 
-  // Periksa status keamanan sistem setiap hari pukul 03:00
-  nodeCron.schedule("0 3 * * *", async () => {
-    await performSecurityCheck(fastify, models, db);
-  });
-
-  // Mengirim notifikasi sistem ke semua klien yang terhubung setiap 24 jam
-  nodeCron.schedule("0 9 * * *", async () => {
-    await sendSystemNotification(fastify, models, encryptionUtils);
-  });
-
   fastify.log.info("Tugas terjadwal berhasil diinisialisasi");
+
+  // Jalankan rotasi API key saat inisialisasi untuk memastikan ada key aktif
+  fastify.log.info("Menjalankan rotasi API key awal...");
+  rotateApiKeys(fastify, models, db)
+    .then(() => {
+      fastify.log.info("Rotasi API key awal berhasil");
+      // Jangan deaktivasi key lama pada inisialisasi awal
+    })
+    .catch((err) => {
+      const errorMessage = err && err.message ? err.message : "Unknown error";
+      fastify.log.error(`Error selama rotasi API key awal: ${errorMessage}`);
+    });
 }
 
 /**
- * Fungsi untuk memutar API key
+ * Fungsi untuk membuat API key baru
+ *
+ * @param {Object} fastify - Instansi fastify
+ * @param {Object} models - Model database aplikasi
+ * @param {Object} db - Koneksi database
+ * @returns {Object} Objek yang berisi ID key yang baru dibuat
+ */
+async function rotateApiKeys(fastify, models, db) {
+  try {
+    fastify.log.info("Memulai pembuatan API key baru");
+
+    // Validasi parameter
+    if (!fastify || !models || !db) {
+      console.error("Pembuatan API key dibatalkan: Parameter tidak lengkap");
+      return null;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
+      fastify.log.error(
+        "Pembuatan API key dibatalkan: Objek database tidak valid"
+      );
+      return null;
+    }
+
+    // Periksa koneksi database sebelum melanjutkan
+    try {
+      await db.raw("SELECT 1");
+      fastify.log.debug(
+        "Koneksi database terverifikasi untuk pembuatan API key"
+      );
+    } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
+      fastify.log.error(
+        `Koneksi database gagal selama pembuatan API key: ${dbErrorMessage}`
+      );
+      return null;
+    }
+
+    // Buat API key baru
+    try {
+      // Generate API key baru
+      const apiKeyValue = crypto.randomBytes(32).toString("hex");
+
+      // Tentukan waktu kedaluwarsa (1 jam + 10 menit)
+      const expirationDate = new Date();
+      expirationDate.setMinutes(expirationDate.getMinutes() + 70);
+
+      // Simpan API key baru ke database
+      const result = await db("api_keys").insert({
+        key: apiKeyValue,
+        description: "Auto-generated key",
+        is_active: true,
+        expires_at: expirationDate,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+
+      // Get the ID of the newly inserted key
+      const newKeyId = result[0];
+
+      fastify.log.info(
+        `API key baru berhasil dibuat. ID: ${newKeyId || "unknown"}`
+      );
+
+      // Kembalikan ID key baru untuk referensi
+      return { newKeyId };
+    } catch (createErr) {
+      const createErrorMessage =
+        createErr && createErr.message
+          ? createErr.message
+          : "Unknown error during key creation";
+      fastify.log.error(`Gagal membuat API key baru: ${createErrorMessage}`);
+      return null;
+    }
+  } catch (err) {
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(`Error selama pembuatan API key: ${errorMessage}`);
+    return null;
+  }
+}
+
+/**
+ * Fungsi untuk menonaktifkan API key lama setelah 10 menit
  *
  * @param {Object} fastify - Instansi fastify
  * @param {Object} models - Model database aplikasi
  * @param {Object} db - Koneksi database
  */
-async function rotateApiKeys(fastify, models, db) {
+async function deactivateOldApiKey(fastify, models, db) {
   try {
-    fastify.log.info("Memulai rotasi API key terjadwal");
+    fastify.log.info("Memulai proses menonaktifkan API key lama");
 
-    // Periksa koneksi database sebelum melanjutkan
-    try {
-      await db.raw("SELECT 1");
-      fastify.log.debug("Koneksi database terverifikasi untuk rotasi API key");
-    } catch (dbErr) {
+    // Validasi parameter
+    if (!fastify || !models || !db) {
+      console.error("Deaktivasi API key dibatalkan: Parameter tidak lengkap");
+      return;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
       fastify.log.error(
-        `Koneksi database gagal selama rotasi API key: ${dbErr.message}`
+        "Deaktivasi API key dibatalkan: Objek database tidak valid"
       );
       return;
     }
 
-    const newKey = await models.ApiKey.rotateKeys();
-    fastify.log.info(`Rotasi API key selesai. ID key baru: ${newKey.id}`);
+    // Periksa koneksi database
+    try {
+      await db.raw("SELECT 1");
+    } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
+      fastify.log.error(
+        `Koneksi database gagal selama deaktivasi API key: ${dbErrorMessage}`
+      );
+      return;
+    }
 
-    // Beritahu klien tentang rotasi key melalui WebSocket (opsional)
-    models.ClientConnection.broadcastMessage({
-      type: "system",
-      action: "api_key_rotated",
-      message: "API key telah dirotasi. Harap dapatkan key baru.",
-      timestamp: new Date().toISOString(),
-    });
+    // Ambil API key terbaru yang aktif
+    const latestActiveKey = await db("api_keys")
+      .where("is_active", true)
+      .orderBy("created_at", "desc")
+      .first();
 
-    // Bersihkan key yang kadaluarsa
-    await models.ApiKey.deleteExpiredKeys();
+    if (!latestActiveKey) {
+      fastify.log.warn("Tidak ada API key aktif ditemukan");
+      return;
+    }
+
+    // Deaktivasi semua key aktif kecuali key terbaru
+    const deactivated = await db("api_keys")
+      .where("is_active", true)
+      .where("id", "!=", latestActiveKey.id)
+      .update({
+        is_active: false,
+        updated_at: new Date(),
+      });
+
+    fastify.log.info(`${deactivated} API key lama berhasil dinonaktifkan`);
   } catch (err) {
-    fastify.log.error(`Error selama rotasi API key: ${err.message}`);
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(
+      `Error selama menonaktifkan API key lama: ${errorMessage}`
+    );
   }
 }
 
@@ -99,20 +238,121 @@ async function cleanupExpiredApiKeys(fastify, models, db) {
   try {
     fastify.log.info("Memulai pembersihan API key kadaluarsa");
 
-    // Periksa koneksi database
-    try {
-      await db.raw("SELECT 1");
-    } catch (dbErr) {
+    // Validasi parameter
+    if (!fastify || !models || !db) {
+      console.error("Pembersihan API key dibatalkan: Parameter tidak lengkap");
+      return;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
       fastify.log.error(
-        `Koneksi database gagal selama pembersihan API key: ${dbErr.message}`
+        "Pembersihan API key dibatalkan: Objek database tidak valid"
       );
       return;
     }
 
-    const deleted = await models.ApiKey.deleteExpiredKeys();
-    fastify.log.info(`Berhasil menghapus ${deleted} API key kadaluarsa`);
+    // Periksa koneksi database
+    try {
+      await db.raw("SELECT 1");
+    } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
+      fastify.log.error(
+        `Koneksi database gagal selama pembersihan API key: ${dbErrorMessage}`
+      );
+      return;
+    }
+
+    // Jalankan pembersihan
+    try {
+      const deleted = await db("api_keys")
+        .where("expires_at", "<", new Date())
+        .delete();
+
+      fastify.log.info(`Berhasil menghapus ${deleted} API key kadaluarsa`);
+    } catch (cleanupErr) {
+      const cleanupErrorMessage =
+        cleanupErr && cleanupErr.message
+          ? cleanupErr.message
+          : "Unknown cleanup error";
+      fastify.log.error(
+        `Gagal melakukan penghapusan API key kadaluarsa: ${cleanupErrorMessage}`
+      );
+    }
   } catch (err) {
-    fastify.log.error(`Error membersihkan API key kadaluarsa: ${err.message}`);
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(`Error membersihkan API key kadaluarsa: ${errorMessage}`);
+  }
+}
+
+/**
+ * Fungsi untuk membersihkan API key lama yang tidak aktif
+ *
+ * @param {Object} fastify - Instansi fastify
+ * @param {Object} models - Model database aplikasi
+ * @param {Object} db - Koneksi database
+ */
+async function cleanupOldApiKeys(fastify, models, db) {
+  try {
+    fastify.log.info("Memulai pembersihan API key lama tidak aktif");
+
+    // Validasi parameter
+    if (!fastify || !models || !db) {
+      console.error(
+        "Pembersihan API key lama dibatalkan: Parameter tidak lengkap"
+      );
+      return;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
+      fastify.log.error(
+        "Pembersihan API key lama dibatalkan: Objek database tidak valid"
+      );
+      return;
+    }
+
+    // Periksa koneksi database
+    try {
+      await db.raw("SELECT 1");
+    } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
+      fastify.log.error(
+        `Koneksi database gagal selama pembersihan API key lama: ${dbErrorMessage}`
+      );
+      return;
+    }
+
+    // Tentukan cutoff date (misalnya key tidak aktif lebih dari 7 hari)
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 7);
+
+    // Hapus key lama dan tidak aktif
+    try {
+      const deleted = await db("api_keys")
+        .where("is_active", false)
+        .where("updated_at", "<", cutoffDate)
+        .delete();
+
+      fastify.log.info(
+        `Berhasil menghapus ${deleted} API key lama tidak aktif`
+      );
+    } catch (cleanupErr) {
+      const cleanupErrorMessage =
+        cleanupErr && cleanupErr.message
+          ? cleanupErr.message
+          : "Unknown cleanup error";
+      fastify.log.error(
+        `Gagal melakukan penghapusan API key lama tidak aktif: ${cleanupErrorMessage}`
+      );
+    }
+  } catch (err) {
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(
+      `Error membersihkan API key lama tidak aktif: ${errorMessage}`
+    );
   }
 }
 
@@ -126,12 +366,28 @@ async function performDatabaseBackup(fastify, db) {
   try {
     fastify.log.info("Memulai backup database mingguan");
 
+    // Validasi parameter
+    if (!fastify || !db) {
+      console.error("Backup database dibatalkan: Parameter tidak lengkap");
+      return;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
+      fastify.log.error(
+        "Backup database dibatalkan: Objek database tidak valid"
+      );
+      return;
+    }
+
     // Periksa koneksi database
     try {
       await db.raw("SELECT 1");
     } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
       fastify.log.error(
-        `Koneksi database gagal selama proses backup: ${dbErr.message}`
+        `Koneksi database gagal selama proses backup: ${dbErrorMessage}`
       );
       return;
     }
@@ -143,11 +399,9 @@ async function performDatabaseBackup(fastify, db) {
     const backupFileName = `backup_${date}_${timestamp}.sql`;
 
     fastify.log.info(`Backup database berhasil dibuat: ${backupFileName}`);
-
-    // Di sini bisa ditambahkan kode untuk menyimpan backup ke cloud storage
-    // atau mengirim notifikasi email
   } catch (err) {
-    fastify.log.error(`Error selama backup database: ${err.message}`);
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(`Error selama backup database: ${errorMessage}`);
   }
 }
 
@@ -160,6 +414,32 @@ async function performDatabaseBackup(fastify, db) {
 async function cleanupOldLogs(fastify, db) {
   try {
     fastify.log.info("Memulai pembersihan log lama");
+
+    // Validasi parameter
+    if (!fastify || !db) {
+      console.error("Pembersihan log dibatalkan: Parameter tidak lengkap");
+      return;
+    }
+
+    // Validasi objek database
+    if (!db || typeof db.raw !== "function") {
+      fastify.log.error(
+        "Pembersihan log dibatalkan: Objek database tidak valid"
+      );
+      return;
+    }
+
+    // Periksa koneksi database
+    try {
+      await db.raw("SELECT 1");
+    } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
+      fastify.log.error(
+        `Koneksi database gagal selama pembersihan log: ${dbErrorMessage}`
+      );
+      return;
+    }
 
     // Tentukan tanggal cutoff (misalnya log lebih dari 3 bulan)
     const cutoffDate = new Date();
@@ -180,138 +460,25 @@ async function cleanupOldLogs(fastify, db) {
         );
       }
     } catch (dbErr) {
+      const dbErrorMessage =
+        dbErr && dbErr.message ? dbErr.message : "Unknown database error";
       fastify.log.error(
-        `Error database selama pembersihan log: ${dbErr.message}`
+        `Error database selama pembersihan log: ${dbErrorMessage}`
       );
     }
   } catch (err) {
-    fastify.log.error(`Error selama pembersihan log: ${err.message}`);
+    const errorMessage = err && err.message ? err.message : "Unknown error";
+    fastify.log.error(`Error selama pembersihan log: ${errorMessage}`);
   }
 }
 
-/**
- * Fungsi untuk memeriksa status keamanan sistem
- *
- * @param {Object} fastify - Instansi fastify
- * @param {Object} models - Model database aplikasi
- * @param {Object} db - Koneksi database
- */
-async function performSecurityCheck(fastify, models, db) {
-  try {
-    fastify.log.info("Memulai pemeriksaan keamanan sistem");
-
-    // Periksa API key yang sudah hampir kadaluarsa (kurang dari 3 hari)
-    const warningDate = new Date();
-    warningDate.setDate(warningDate.getDate() + 3);
-
-    try {
-      const expiringSoon = await db(models.ApiKey.tableName)
-        .where("is_active", true)
-        .whereBetween("expires_at", [new Date(), warningDate])
-        .count("id as count")
-        .first();
-
-      if (expiringSoon.count > 0) {
-        fastify.log.warn(
-          `Perhatian: ${expiringSoon.count} API key akan kadaluarsa dalam 3 hari ke depan`
-        );
-
-        // Kirim notifikasi ke admin (misalnya via WebSocket)
-        models.ClientConnection.broadcastMessage({
-          type: "admin_alert",
-          action: "security_check",
-          message: `${expiringSoon.count} API key akan kadaluarsa dalam 3 hari ke depan`,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      // Periksa login yang gagal (jika ada tabel untuk itu)
-      const hasLoginAttemptsTable = await db.schema.hasTable("login_attempts");
-      if (hasLoginAttemptsTable) {
-        const recentTime = new Date();
-        recentTime.setHours(recentTime.getHours() - 1);
-
-        const recentFailedAttempts = await db("login_attempts")
-          .where("success", false)
-          .where("created_at", ">", recentTime)
-          .count("id as count")
-          .first();
-
-        if (recentFailedAttempts.count > 10) {
-          fastify.log.warn(
-            `Perhatian: ${recentFailedAttempts.count} percobaan login gagal dalam 1 jam terakhir`
-          );
-
-          // Kirim notifikasi keamanan
-          models.ClientConnection.broadcastMessage({
-            type: "admin_alert",
-            action: "security_check",
-            message: `Kemungkinan serangan brute force: ${recentFailedAttempts.count} percobaan login gagal dalam 1 jam terakhir`,
-            timestamp: new Date().toISOString(),
-            level: "high",
-          });
-        }
-      }
-    } catch (dbErr) {
-      fastify.log.error(
-        `Error database selama pemeriksaan keamanan: ${dbErr.message}`
-      );
-    }
-
-    fastify.log.info("Pemeriksaan keamanan sistem selesai");
-  } catch (err) {
-    fastify.log.error(`Error selama pemeriksaan keamanan: ${err.message}`);
-  }
-}
-
-/**
- * Fungsi untuk mengirim notifikasi sistem ke semua klien
- *
- * @param {Object} fastify - Instansi fastify
- * @param {Object} models - Model database aplikasi
- * @param {Object} encryptionUtils - Utilitas enkripsi/dekripsi
- */
-async function sendSystemNotification(fastify, models, encryptionUtils) {
-  try {
-    fastify.log.info("Mengirim notifikasi sistem harian ke klien");
-
-    // Hitung jumlah koneksi aktif
-    const activeConnections =
-      models.ClientConnection.getAllConnections().length;
-
-    // Buat pesan status sistem
-    const statusMessage = {
-      type: "system_status",
-      message: "Status sistem: Normal",
-      activeConnections: activeConnections,
-      serverTime: new Date().toISOString(),
-      serverUptime: process.uptime(),
-    };
-
-    // Broadcast ke semua klien
-    const sentCount = models.ClientConnection.broadcastMessage({
-      type: "system",
-      action: "status_update",
-      data: statusMessage,
-      timestamp: new Date().toISOString(),
-    });
-
-    fastify.log.info(
-      `Notifikasi sistem berhasil dikirim ke ${sentCount} klien`
-    );
-  } catch (err) {
-    fastify.log.error(
-      `Error selama pengiriman notifikasi sistem: ${err.message}`
-    );
-  }
-}
-
+// Ekspor fungsi-fungsi yang diperlukan
 export {
   setupScheduledTasks,
   rotateApiKeys,
+  deactivateOldApiKey,
   cleanupExpiredApiKeys,
+  cleanupOldApiKeys,
   performDatabaseBackup,
   cleanupOldLogs,
-  performSecurityCheck,
-  sendSystemNotification,
 };
