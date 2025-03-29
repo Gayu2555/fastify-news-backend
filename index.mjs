@@ -3,6 +3,8 @@ import cors from "@fastify/cors";
 import dotenv from "dotenv";
 import knex from "knex";
 import ipaddr from "ipaddr.js";
+import path from "path";
+import fs from "fs/promises";
 
 // Muat variabel lingkungan
 dotenv.config();
@@ -465,6 +467,103 @@ fastify.get("/api/positions/:position", async (request, reply) => {
   }
 });
 
+// Mengambil Gambar dengan tambahan Path
+
+// Konfigurasi path penyimpanan gambar
+const IMAGE_STORAGE_PATHS = [
+  path.join(
+    "C:",
+    "laragon",
+    "www",
+    "FilamentPHP",
+    "cms",
+    "storage",
+    "app",
+    "public",
+    "article_images"
+  ),
+  path.join(process.cwd(), "cms", "storage", "app", "public", "article_images"),
+  path.join(process.cwd(), "storage", "app", "public", "article_images"),
+  path.join(process.cwd(), "public", "storage", "article_images"),
+  path.join(process.cwd(), "article_images"),
+];
+
+// Fungsi sanitasi nama file
+const sanitizeFilename = (filename) => {
+  return path
+    .basename(filename)
+    .replace(/[^a-zA-Z0-9.-]/g, "")
+    .substring(0, 255);
+};
+
+// Fungsi pencarian gambar
+const findImage = async (filename) => {
+  const sanitizedFilename = sanitizeFilename(filename);
+
+  for (const basePath of IMAGE_STORAGE_PATHS) {
+    const fullPath = path.join(basePath, sanitizedFilename);
+
+    try {
+      await fs.access(fullPath);
+      return fullPath;
+    } catch {
+      continue;
+    }
+  }
+
+  // Path gambar default
+  return path.join(
+    "C:",
+    "laragon",
+    "www",
+    "FilamentPHP",
+    "cms",
+    "storage",
+    "app",
+    "public",
+    "default-image.jpg"
+  );
+};
+
+// Fungsi menentukan tipe konten
+const getContentType = (filename) => {
+  const ext = path.extname(filename).toLowerCase();
+  const mimeTypes = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+  };
+
+  return mimeTypes[ext] || "application/octet-stream";
+};
+
+// Route handler gambar artikel
+fastify.get("/article_images/:filename", async (request, reply) => {
+  try {
+    const { filename } = request.params;
+    const imagePath = await findImage(filename);
+
+    // Baca file gambar
+    const imageBuffer = await fs.readFile(imagePath);
+
+    // Tetapkan header
+    reply
+      .header("Content-Type", getContentType(imagePath))
+      .header("Cache-Control", "public, max-age=86400")
+      .send(imageBuffer);
+  } catch (error) {
+    fastify.log.error(`Kesalahan mengakses gambar: ${error}`);
+    reply.code(500).send({
+      error: "Gagal memuat gambar",
+      message: "Terjadi kesalahan internal",
+    });
+  }
+});
 // Mendapatkan artikel berdasarkan posisi untuk kategori tertentu
 fastify.get(
   "/api/categories/:categoryId/positions/:position",
