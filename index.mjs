@@ -366,21 +366,50 @@ fastify.get("/api/articles/:id", async (request, reply) => {
 // Mendapatkan artikel berdasarkan slug
 fastify.get("/api/articles/slug/:slug", async (request, reply) => {
   try {
-    const article = await fastify.db
+    let slug = request.params.slug.trim(); // Hapus newline dan spasi di awal/akhir
+    console.log(`Mencari artikel dengan slug: '${slug}'`);
+
+    // Tambahkan log untuk memastikan slug tidak memiliki karakter aneh
+    console.log(`Slug setelah trim: '${slug}'`);
+
+    // Query database
+    const query = fastify.db
       .select("a.*", "c.name as category_name", "c.slug as category_slug")
       .from("articles as a")
       .join("categories as c", "a.category_id", "c.id")
-      .where("a.slug", request.params.slug)
-      .first();
+      .where("a.slug", slug);
+
+    console.log("SQL Query:", query.toString());
+
+    const article = await query.first();
+    console.log(
+      "Hasil query:",
+      article ? "Artikel ditemukan" : "Artikel tidak ditemukan"
+    );
 
     if (!article) {
-      return reply.code(404).send({ error: "Artikel tidak ditemukan" });
+      // Debug: Cek contoh artikel yang tersedia
+      const allArticles = await fastify.db
+        .select("id", "slug", "title")
+        .from("articles")
+        .limit(10);
+
+      console.log("Contoh artikel yang tersedia:", allArticles);
+
+      return reply.code(404).send({
+        error: "Artikel tidak ditemukan",
+        slug,
+        searchedFor: slug,
+      });
     }
 
     return { article };
   } catch (error) {
-    fastify.log.error(error);
-    reply.code(500).send({ error: "Terjadi kesalahan pada database" });
+    fastify.log.error("Error dalam endpoint slug:", error);
+    reply.code(500).send({
+      error: "Terjadi kesalahan pada database",
+      message: error.message,
+    });
   }
 });
 
