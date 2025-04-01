@@ -637,7 +637,112 @@ fastify.get(
     }
   }
 );
+// ===== Rute Untuk Pencarian =====
+// API endpoint untuk pencarian artikel dengan saran pencarian
+fastify.get("/api/articles/search", async (request, reply) => {
+  try {
+    const searchQuery = request.query.q || "";
+    const limit = parseInt(request.query.limit) || 10;
 
+    if (!searchQuery) {
+      return { suggestions: [], articles: [] };
+    }
+
+    // Mendapatkan saran pencarian berdasarkan judul artikel
+    const suggestions = await fastify.db
+      .select("title")
+      .from("articles")
+      .whereRaw("LOWER(title) LIKE ?", [`${searchQuery.toLowerCase()}%`])
+      .orderBy("date_published", "desc")
+      .limit(limit);
+
+    // Mendapatkan artikel yang cocok dengan query pencarian
+    const articles = await fastify.db
+      .select("a.*", "c.name as category_name", "c.slug as category_slug")
+      .from("articles as a")
+      .join("categories as c", "a.category_id", "c.id")
+      .whereRaw("LOWER(a.title) LIKE ?", [`%${searchQuery.toLowerCase()}%`])
+      .orWhereRaw("LOWER(a.content) LIKE ?", [`%${searchQuery.toLowerCase()}%`])
+      .orderBy("a.date_published", "desc")
+      .limit(limit);
+
+    return {
+      suggestions: suggestions.map((item) => item.title),
+      articles,
+    };
+  } catch (error) {
+    fastify.log.error(error);
+    reply.code(500).send({ error: "Terjadi kesalahan pada database" });
+  }
+});
+
+// Endpoint pencarian advanced dengan filter kategori
+fastify.get("/api/articles/search/advanced", async (request, reply) => {
+  const searchQuery = request.query.q || "";
+  const categoryId = request.query.categoryId;
+  const page = parseInt(request.query.page) || 1;
+  const perPage = parseInt(request.query.perPage) || 10;
+  const offset = (page - 1) * perPage;
+
+  try {
+    // Buat query dasar
+    let articlesQuery = fastify.db
+      .select("a.*", "c.name as category_name", "c.slug as category_slug")
+      .from("articles as a")
+      .join("categories as c", "a.category_id", "c.id");
+
+    // Buat query untuk menghitung total hasil
+    let countQuery = fastify.db("articles as a");
+
+    // Tambahkan kondisi pencarian jika ada query
+    if (searchQuery) {
+      articlesQuery = articlesQuery
+        .whereRaw("LOWER(a.title) LIKE ?", [`%${searchQuery.toLowerCase()}%`])
+        .orWhereRaw("LOWER(a.content) LIKE ?", [
+          `%${searchQuery.toLowerCase()}%`,
+        ]);
+
+      countQuery = countQuery
+        .whereRaw("LOWER(a.title) LIKE ?", [`%${searchQuery.toLowerCase()}%`])
+        .orWhereRaw("LOWER(a.content) LIKE ?", [
+          `%${searchQuery.toLowerCase()}%`,
+        ]);
+    }
+
+    // Tambahkan filter kategori jika ada
+    if (categoryId) {
+      articlesQuery = articlesQuery.andWhere("a.category_id", categoryId);
+      countQuery = countQuery.andWhere("a.category_id", categoryId);
+    }
+
+    // Finalisasi query artikel dengan ordering, limit dan offset
+    articlesQuery = articlesQuery
+      .orderBy("a.date_published", "desc")
+      .limit(perPage)
+      .offset(offset);
+
+    // Eksekusi query artikel
+    const articles = await articlesQuery;
+
+    // Hitung total hasil untuk pagination
+    const countResult = await countQuery.count("* as total").first();
+    const total = countResult.total;
+    const totalPages = Math.ceil(total / perPage);
+
+    return {
+      articles,
+      pagination: {
+        total,
+        perPage,
+        currentPage: page,
+        totalPages,
+      },
+    };
+  } catch (error) {
+    fastify.log.error(error);
+    reply.code(500).send({ error: "Terjadi kesalahan pada database" });
+  }
+});
 // Route utama dengan pesan sambutan yang lebih informatif
 fastify.get("/", async (request, reply) => {
   return {
