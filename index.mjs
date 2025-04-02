@@ -675,7 +675,45 @@ fastify.get("/api/articles/search", async (request, reply) => {
     reply.code(500).send({ error: "Terjadi kesalahan pada database" });
   }
 });
+// ===== Rute untuk Suggestions =====
+fastify.get("/api/suggestions", async (request, reply) => {
+  const searchQuery = request.query.q || "";
 
+  // Validasi query pencarian
+  if (!searchQuery || searchQuery.length < 2) {
+    reply.code(400).send({
+      status: "error",
+      message: "Parameter pencarian terlalu pendek",
+      suggestions: [],
+    });
+    return;
+  }
+
+  try {
+    // Query untuk mencari saran berdasarkan judul artikel
+    const suggestions = await fastify.db
+      .select("title")
+      .from("articles")
+      .whereRaw("LOWER(title) LIKE ?", [`%${searchQuery.toLowerCase()}%`])
+      .limit(10);
+
+    // Ekstrak judul sebagai saran
+    const suggestionList = suggestions.map((item) => item.title);
+
+    return {
+      status: "success",
+      count: suggestionList.length,
+      suggestions: suggestionList,
+    };
+  } catch (error) {
+    fastify.log.error(error);
+    reply.code(500).send({
+      status: "error",
+      message: "Terjadi kesalahan pada database",
+      suggestions: [],
+    });
+  }
+});
 // Endpoint pencarian advanced dengan filter kategori
 fastify.get("/api/articles/search/advanced", async (request, reply) => {
   const searchQuery = request.query.q || "";
